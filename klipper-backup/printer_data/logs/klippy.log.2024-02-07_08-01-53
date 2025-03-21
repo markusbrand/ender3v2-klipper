@@ -1,0 +1,2539 @@
+Starting Klippy...
+Args: ['/home/pi/klipper/klippy/klippy.py', '/home/pi/printer_data/config/printer.cfg', '-I', '/home/pi/printer_data/comms/klippy.serial', '-l', '/home/pi/printer_data/logs/klippy.log', '-a', '/home/pi/printer_data/comms/klippy.sock']
+Git version: 'v0.12.0-102-g9f41f53c-dirty'
+Untracked files: klippy/extras/gcode_shell_command.py
+Branch: master
+Remote: origin
+Tracked URL: https://github.com/Klipper3d/klipper
+CPU: 4 core ?
+Python: '3.11.2 (main, Mar 13 2023, 12:18:29) [GCC 12.2.0]'
+Start printer at Wed Feb  7 01:58:16 2024 (1707267496.6 117752.9)
+===== Config file =====
+[virtual_sdcard]
+path = ~/printer_data/gcodes
+on_error_gcode = CANCEL_PRINT
+
+[pause_resume]
+recover_velocity = 25
+
+[display_status]
+
+[respond]
+default_prefix = 
+
+[gcode_macro CANCEL_PRINT]
+description = Cancel the actual running print
+rename_existing = BASE_CANCEL_PRINT
+gcode = 
+	TURN_OFF_HEATERS
+	G0 X5 Y220 Z10
+	CLEAR_PAUSE
+	BASE_CANCEL_PRINT
+
+[gcode_macro PAUSE]
+description = Pause the actual running print
+rename_existing = PAUSE_BASE
+gcode = 
+	
+	{% set x = params.X|default(5) %}
+	{% set y = params.Y|default(225) %}
+	{% set z = params.Z|default(10)|float %}
+	{% set e = params.E|default(1) %}
+	
+	{% set max_z = printer.toolhead.axis_maximum.z|float %}
+	{% set act_z = printer.toolhead.position.z|float %}
+	{% set lift_z = z|abs %}
+	{% if act_z < (max_z - lift_z) %}
+	{% set z_safe = lift_z %}
+	{% else %}
+	{% set z_safe = max_z - act_z %}
+	{% endif %}
+	
+	PAUSE_BASE
+	G91
+	{% if printer.extruder.can_extrude|lower == 'true' %}
+	G1 E-{e} F2100
+	{% else %}
+	{action_respond_info("Extruder not hot enough")}
+	{% endif %}
+	{% if "xyz" in printer.toolhead.homed_axes %}
+	G1 Z{z_safe}
+	G90
+	G1 X{x} Y{y} F6000
+	{% else %}
+	{action_respond_info("Printer not homed")}
+	{% endif %}
+
+[gcode_macro RESUME]
+description = Resume the actual running print
+rename_existing = RESUME_BASE
+variable_last_extruder_temp = {'restore': False, 'temp': 0}
+variable_restore_idle_timeout = 0
+variable_idle_state = False
+gcode = 
+	
+	{% set e = params.E|default(1) %}
+	
+	{% if 'VELOCITY' in params|upper %}
+	{% set get_params = ('VELOCITY=' + params.VELOCITY)  %}
+	{%else %}
+	{% set get_params = "" %}
+	{% endif %}
+	
+	G91
+	{% if printer.extruder.can_extrude|lower == 'true' %}
+	G1 E{e} F2100
+	{% else %}
+	{action_respond_info("Extruder not hot enough")}
+	{% endif %}
+	RESUME_BASE {get_params}
+
+[gcode_macro SET_PAUSE_NEXT_LAYER]
+description = Enable a pause if the next layer is reached
+gcode = 
+	{% set pause_next_layer = printer['gcode_macro SET_PRINT_STATS_INFO'].pause_next_layer %}
+	{% set ENABLE = params.ENABLE|default(1)|int != 0 %}
+	{% set MACRO = params.MACRO|default(pause_next_layer.call, True) %}
+	SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer VALUE="{{ 'enable': ENABLE, 'call': MACRO }}"
+
+[gcode_macro SET_PAUSE_AT_LAYER]
+description = Enable/disable a pause if a given layer number is reached
+gcode = 
+	{% set pause_at_layer = printer['gcode_macro SET_PRINT_STATS_INFO'].pause_at_layer %}
+	{% set ENABLE = params.ENABLE|int != 0 if params.ENABLE is defined
+	else params.LAYER is defined %}
+	{% set LAYER = params.LAYER|default(pause_at_layer.layer)|int %}
+	{% set MACRO = params.MACRO|default(pause_at_layer.call, True) %}
+	SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_at_layer VALUE="{{ 'enable': ENABLE, 'layer': LAYER, 'call': MACRO }}"
+
+[gcode_macro SET_PRINT_STATS_INFO]
+rename_existing = SET_PRINT_STATS_INFO_BASE
+description = Overwrite, to get pause_next_layer and pause_at_layer feature
+variable_pause_next_layer = { 'enable': False, 'call': "PAUSE" }
+variable_pause_at_layer = { 'enable': False, 'layer': 0, 'call': "PAUSE" }
+gcode = 
+	{% if pause_next_layer.enable %}
+	RESPOND TYPE=echo MSG='{"%s, forced by pause_next_layer" % pause_next_layer.call}'
+	{pause_next_layer.call}
+	SET_PAUSE_NEXT_LAYER ENABLE=0
+	{% elif pause_at_layer.enable and params.CURRENT_LAYER is defined and params.CURRENT_LAYER|int == pause_at_layer.layer %}
+	RESPOND TYPE=echo MSG='{"%s, forced by pause_at_layer [%d]" % (pause_at_layer.call, pause_at_layer.layer)}'
+	{pause_at_layer.call}
+	SET_PAUSE_AT_LAYER ENABLE=0
+	{% endif %}
+	SET_PRINT_STATS_INFO_BASE {rawparams}
+
+[gcode_macro _TOOLHEAD_PARK_PAUSE_CANCEL]
+description = Helper: park toolhead used in PAUSE and CANCEL_PRINT
+gcode = 
+	
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set velocity = printer.configfile.settings.pause_resume.recover_velocity %}
+	{% set use_custom     = client.use_custom_pos|default(false)|lower == 'true' %}
+	{% set custom_park_x  = client.custom_park_x|default(0.0) %}
+	{% set custom_park_y  = client.custom_park_y|default(0.0) %}
+	{% set park_dz        = client.custom_park_dz|default(2.0)|abs %}
+	{% set sp_hop         = client.speed_hop|default(15) * 60 %}
+	{% set sp_move        = client.speed_move|default(velocity) * 60 %}
+	
+	{% set origin    = printer.gcode_move.homing_origin %}
+	{% set act       = printer.gcode_move.gcode_position %}
+	{% set max       = printer.toolhead.axis_maximum %}
+	{% set cone      = printer.toolhead.cone_start_z|default(max.z) %}
+	{% set round_bed = True if printer.configfile.settings.printer.kinematics is in ['delta','polar','rotary_delta','winch']
+	else False %}
+	
+	{% set z_min = params.Z_MIN|default(0)|float %}
+	{% set z_park = [[(act.z + park_dz), z_min]|max, (max.z - origin.z)]|min %}
+	{% set x_park = params.X       if params.X is defined
+	else custom_park_x  if use_custom
+	else 0.0            if round_bed
+	else (max.x - 5.0) %}
+	{% set y_park = params.Y       if params.Y is defined
+	else custom_park_y  if use_custom
+	else (max.y - 5.0)  if round_bed and z_park < cone
+	else 0.0            if round_bed
+	else (max.y - 5.0) %}
+	
+	_CLIENT_RETRACT
+	{% if "xyz" in printer.toolhead.homed_axes %}
+	G90
+	G1 Z{z_park} F{sp_hop}
+	G1 X{x_park} Y{y_park} F{sp_move}
+	{% if not printer.gcode_move.absolute_coordinates %} G91 {% endif %}
+	{% else %}
+	RESPOND TYPE=echo MSG='Printer not homed'
+	{% endif %}
+
+[gcode_macro _CLIENT_EXTRUDE]
+description = Extrudes, if the extruder is hot enough
+gcode = 
+	
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set use_fw_retract = (client.use_fw_retract|default(false)|lower == 'true') and (printer.firmware_retraction is defined) %}
+	{% set length = params.LENGTH|default(client.unretract)|default(1.0)|float %}
+	{% set speed = params.SPEED|default(client.speed_unretract)|default(35) %}
+	{% set absolute_extrude = printer.gcode_move.absolute_extrude %}
+	
+	{% if printer.toolhead.extruder != '' %}
+	{% if printer[printer.toolhead.extruder].can_extrude %}
+	{% if use_fw_retract %}
+	{% if length < 0 %}
+	G10
+	{% else %}
+	G11
+	{% endif %}
+	{% else %}
+	M83
+	G1 E{length} F{(speed|float|abs) * 60}
+	{% if absolute_extrude %}
+	M82
+	{% endif %}
+	{% endif %}
+	{% else %}
+	RESPOND TYPE=echo MSG='{"\"%s\" not hot enough" % printer.toolhead.extruder}'
+	{% endif %}
+	{% endif %}
+
+[gcode_macro _CLIENT_RETRACT]
+description = Retracts, if the extruder is hot enough
+gcode = 
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set length = params.LENGTH|default(client.retract)|default(1.0)|float %}
+	{% set speed = params.SPEED|default(client.speed_retract)|default(35) %}
+	
+	_CLIENT_EXTRUDE LENGTH=-{length|float|abs} SPEED={speed|float|abs}
+
+[gcode_macro START_PRINT]
+gcode = 
+	RESPOND MSG="Preparing to print"
+	
+	{% set BED_TEMP = params.BED_TEMP|default(60)|float %}
+	
+	{% set EXTRUDER_TEMP = params.EXTRUDER_TEMP|default(190)|float %}
+	
+	SETUP_KAMP_MESHING DISPLAY_PARAMETERS=1 LED_ENABLE=1 FUZZ_ENABLE=1
+	SETUP_LINE_PURGE DISPLAY_PARAMETERS=1 ADAPTIVE_ENABLE=1 Z_HEIGHT=.3 PURGE_AMOUNT=20 LINE_LENGTH=25
+	
+	G90
+	M83
+	RESPOND MSG="Warming up for bed leveling"
+	M104 S170
+	M140 S{BED_TEMP}
+	M109 S170
+	M190 S{BED_TEMP}
+	G28
+	
+	
+	BED_MESH_CLEAR
+	EXCLUDE_OBJECT_DEFINE
+	RESPOND MSG="KAMP Adaptive Bed Meshing"
+	BED_MESH_CALIBRATE
+	Smart_Park
+	RESPOND MSG="Heating to print temp"
+	M104 S{EXTRUDER_TEMP}
+	G0 Z50 F240
+	RESPOND MSG="Clean bed and nozzle"
+	G0 X2 Y220 F3000
+	M109 S{EXTRUDER_TEMP}
+	RESPOND MSG="KAMP Line Purge"
+	LINE_PURGE
+	RESPOND MSG="Print Started"
+	CLEAR_PAUSE
+
+[gcode_macro END_PRINT]
+gcode = 
+	
+	RESPOND MSG="Print Finished"
+	G91
+	G1 E-.5 Z0.2 F2400
+	G1 X5 Y5 F6000
+	G1 Z10
+	G90
+	
+	
+	G1 Z{printer.toolhead.position.z + 10} F600
+	G1 X0 Y220 F6000
+	M106 S0
+	M104 S0
+	M140 S0
+	
+	
+	M84 X Y E
+
+[gcode_macro Pressure_Advance]
+gcode = 
+	SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=1 ACCEL=500
+	TUNING_TOWER COMMAND=SET_PRESSURE_ADVANCE PARAMETER=ADVANCE START=0 FACTOR=.005
+
+[gcode_macro G29]
+gcode = 
+	G28
+	BED_MESH_CALIBRATE
+	G0 X0 Y0 Z10 F6000
+	BED_MESH_PROFILE save=default
+
+[gcode_macro Load_Filament]
+gcode = 
+	SAVE_GCODE_STATE NAME=loading_filament
+	M117 Loading Filament
+	M83
+	G92 E0.0
+	G1 E5 F200
+	G92 E0.0
+	RESTORE_GCODE_STATE NAME=loading_filament
+
+[gcode_macro Unload_Filament]
+gcode = 
+	SAVE_GCODE_STATE NAME=unloading_filament
+	M125
+	M117 Unloading Filament
+	G91
+	G1 E10 F100
+	G92 E0.0
+	G1 E-5 F3000
+	G92 E0.0
+	RESTORE_GCODE_STATE NAME=unloading_filament
+
+[gcode_macro Filament_Change]
+gcode = 
+	M117 Filament Change
+	M118 Filament Change
+	SAVE_GCODE_STATE NAME=filament_change
+	PAUSE
+	G91
+	G1 E-1 F300
+	M125
+	G1 E-5 F300
+	RESTORE_GCODE_STATE NAME=filament_change
+
+[gcode_macro M600]
+gcode = 
+	{% set X = params.X|default(50)|float %}
+	{% set Y = params.Y|default(0)|float %}
+	{% set Z = params.Z|default(10)|float %}
+	SAVE_GCODE_STATE NAME=M600_state
+	PAUSE
+	G91
+	G1 E-.8 F2700
+	G1 Z{Z}
+	G90
+	G1 X{X} Y{Y} F3000
+	G91
+	G1 E-50 F1000
+	RESTORE_GCODE_STATE NAME=M600_state
+
+[gcode_macro M125]
+gcode = 
+	SAVE_GCODE_STATE NAME=parking
+	M117 Parking toolhead
+	G91
+	G1 Z10 F600
+	G90
+	G1 X5 Y225 F4000
+	RESTORE_GCODE_STATE NAME=parking
+
+[gcode_macro update_git]
+gcode = 
+	RUN_SHELL_COMMAND CMD=update_git_script
+
+[gcode_shell_command update_git_script]
+command = bash /home/pi/klipper-backup/script.sh
+timeout = 90.0
+verbose = True
+
+[gcode_macro calibrate_z_offset]
+gcode = 
+	G91
+	G1 Z10 F600
+	G90
+	G0 X140 Y150
+	PROBE_CALIBRATE
+
+[gcode_macro PID_calibrate_bed]
+gcode = 
+	{% set temp = params.temp|default(60) %}
+	PID_CALIBRATE HEATER=heater_bed TARGET={temp}
+
+[gcode_macro PID_calibrate_extruder]
+gcode = 
+	{% set temp = params.temp|default(200) %}
+	PID_CALIBRATE HEATER=extruder TARGET={temp}
+
+[gcode_macro BED_MESH_CALIBRATE]
+rename_existing = _BED_MESH_CALIBRATE
+gcode = 
+	
+	{% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+	{% set bed_mesh_min = printer.configfile.settings.bed_mesh.mesh_min %}
+	{% set bed_mesh_max = printer.configfile.settings.bed_mesh.mesh_max %}
+	{% set probe_count = printer.configfile.settings.bed_mesh.probe_count %}
+	{% set kamp_settings = printer["gcode_macro _KAMP_Settings"] %}
+	{% set verbose_enable = kamp_settings.verbose_enable | abs %}
+	{% set probe_dock_enable = kamp_settings.probe_dock_enable | abs %}
+	{% set attach_macro = kamp_settings.attach_macro | string %}
+	{% set detach_macro = kamp_settings.detach_macro | string %}
+	{% set mesh_margin = kamp_settings.mesh_margin | float %}
+	{% set fuzz_amount = kamp_settings.fuzz_amount | float %}
+	{% set probe_count = probe_count if probe_count|length > 1 else probe_count * 2  %}
+	{% set max_probe_point_distance_x = ( bed_mesh_max[0] - bed_mesh_min[0] ) / (probe_count[0] - 1)  %}
+	{% set max_probe_point_distance_y = ( bed_mesh_max[1] - bed_mesh_min[1] ) / (probe_count[1] - 1)  %}
+	{% set x_min = all_points | map(attribute=0) | min | default(bed_mesh_min[0]) %}
+	{% set y_min = all_points | map(attribute=1) | min | default(bed_mesh_min[1]) %}
+	{% set x_max = all_points | map(attribute=0) | max | default(bed_mesh_max[0]) %}
+	{% set y_max = all_points | map(attribute=1) | max | default(bed_mesh_max[1]) %}
+	
+	{% set fuzz_range = range((0) | int, (fuzz_amount * 100) | int + 1) %}
+	{% set adapted_x_min = x_min - mesh_margin - (fuzz_range | random / 100.0) %}
+	{% set adapted_y_min = y_min - mesh_margin - (fuzz_range | random / 100.0) %}
+	{% set adapted_x_max = x_max + mesh_margin + (fuzz_range | random / 100.0) %}
+	{% set adapted_y_max = y_max + mesh_margin + (fuzz_range | random / 100.0) %}
+	
+	{% set adapted_x_min = [adapted_x_min , bed_mesh_min[0]] | max %}
+	{% set adapted_y_min = [adapted_y_min , bed_mesh_min[1]] | max %}
+	{% set adapted_x_max = [adapted_x_max , bed_mesh_max[0]] | min %}
+	{% set adapted_y_max = [adapted_y_max , bed_mesh_max[1]] | min %}
+	
+	{% set points_x = (((adapted_x_max - adapted_x_min) / max_probe_point_distance_x) | round(method='ceil') | int) + 1 %}
+	{% set points_y = (((adapted_y_max - adapted_y_min) / max_probe_point_distance_y) | round(method='ceil') | int) + 1 %}
+	
+	{% if (([points_x, points_y]|max) > 6) %}
+	{% set algorithm = "bicubic" %}
+	{% set min_points = 4 %}
+	{% else %}
+	{% set algorithm = "lagrange" %}
+	{% set min_points = 3 %}
+	{% endif %}
+	
+	{% set points_x = [points_x , min_points]|max %}
+	{% set points_y = [points_y , min_points]|max %}
+	{% set points_x = [points_x , probe_count[0]]|min %}
+	{% set points_y = [points_y , probe_count[1]]|min %}
+	
+	{% if verbose_enable == True %}
+	{% if printer.exclude_object.objects != [] %}
+	
+	{ action_respond_info( "Algorithm: {}.".format(
+	(algorithm),
+	)) }
+	
+	{ action_respond_info("Default probe count: {},{}.".format(
+	(probe_count[0]),
+	(probe_count[1]),
+	)) }
+	
+	{ action_respond_info("Adapted probe count: {},{}.".format(
+	(points_x),
+	(points_y),
+	)) }
+	
+	{action_respond_info("Default mesh bounds: {}, {}.".format(
+	(bed_mesh_min[0],bed_mesh_min[1]),
+	(bed_mesh_max[0],bed_mesh_max[1]),
+	)) }
+	
+	{% if mesh_margin > 0 %}
+	{action_respond_info("Mesh margin is {}, mesh bounds extended by {}mm.".format(
+	(mesh_margin),
+	(mesh_margin),
+	)) }
+	{% else %}
+	{action_respond_info("Mesh margin is 0, margin not increased.")}
+	{% endif %}
+	
+	{% if fuzz_amount > 0 %}
+	{action_respond_info("Mesh point fuzzing enabled, points fuzzed up to {}mm.".format(
+	(fuzz_amount),
+	)) }
+	{% else %}
+	{action_respond_info("Fuzz amount is 0, mesh points not fuzzed.")}
+	{% endif %}
+	
+	{ action_respond_info("Adapted mesh bounds: {}, {}.".format(
+	(adapted_x_min, adapted_y_min),
+	(adapted_x_max, adapted_y_max),
+	)) }
+	
+	{action_respond_info("KAMP adjustments successful. Happy KAMPing!")}
+	
+	{% else %}
+	
+	{action_respond_info("No objects detected! Check your gcode and make sure that EXCLUDE_OBJECT_DEFINE is happening before BED_MESH_CALIBRATE is called. Defaulting to regular meshing.")}
+	G4 P5000
+	{% endif %}
+	
+	{% endif %}
+	
+	{% if probe_dock_enable == True %}
+	{attach_macro}
+	{% endif %}
+	
+	_BED_MESH_CALIBRATE mesh_min={adapted_x_min},{adapted_y_min} mesh_max={adapted_x_max},{adapted_y_max} ALGORITHM={algorithm} PROBE_COUNT={points_x},{points_y}
+	
+	{% if probe_dock_enable == True %}
+	{detach_macro}
+	{% endif %}
+
+[gcode_macro LINE_PURGE]
+description = A purge macro that adapts to be near your actual printed objects
+gcode = 
+	
+	{% set travel_speed = (printer.toolhead.max_velocity) * 60 | float %}
+	{% set cross_section = printer.configfile.settings.extruder.max_extrude_cross_section | float %}
+	
+	
+	{% if printer.firmware_retraction is defined %}
+	{% set RETRACT = G10 | string %}
+	{% set UNRETRACT = G11 | string %}
+	{% else %}
+	{% set RETRACT = 'G1 E-.5 F2100' | string %}
+	{% set UNRETRACT = 'G1 E.5 F2100' | string %}
+	{% endif %}
+	
+	
+	{% set verbose_enable = printer["gcode_macro _KAMP_Settings"].verbose_enable | abs %}
+	{% set purge_height = printer["gcode_macro _KAMP_Settings"].purge_height | float %}
+	{% set tip_distance = printer["gcode_macro _KAMP_Settings"].tip_distance | float %}
+	{% set purge_margin = printer["gcode_macro _KAMP_Settings"].purge_margin | float %}
+	{% set purge_amount = printer["gcode_macro _KAMP_Settings"].purge_amount | float %}
+	{% set flow_rate = printer["gcode_macro _KAMP_Settings"].flow_rate | float %}
+	
+	
+	
+	{% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+	{% set purge_x_min = (all_points | map(attribute=0) | min | default(0)) %}
+	{% set purge_x_max = (all_points | map(attribute=0) | max | default(0)) %}
+	{% set purge_y_min = (all_points | map(attribute=1) | min | default(0)) %}
+	{% set purge_y_max = (all_points | map(attribute=1) | max | default(0)) %}
+	
+	{% set purge_x_center = ([((purge_x_max + purge_x_min) / 2) - (purge_amount / 2), 0] | max) %}
+	{% set purge_y_center = ([((purge_y_max + purge_y_min) / 2) - (purge_amount / 2), 0] | max) %}
+	
+	{% set purge_x_origin = ([purge_x_min - purge_margin, 0] | max) %}
+	{% set purge_y_origin = ([purge_y_min - purge_margin, 0] | max) %}
+	
+	
+	{% set purge_move_speed = (flow_rate / 5.0) * 60 | float %}
+	
+	{% if cross_section < 5 %}
+	
+	{action_respond_info("[Extruder] max_extrude_cross_section is insufficient for purge, please set it to 5 or greater. Purge skipped.")}
+	
+	{% else %}
+	
+	{% if verbose_enable == True %}
+	
+	{action_respond_info("Moving filament tip {}mms".format(
+	(tip_distance),
+	)) }
+	{% endif %}
+	
+	{% if printer.firmware_retraction is defined %}
+	{action_respond_info("KAMP purge is using firmware retraction.")}
+	{% else %}
+	{action_respond_info("KAMP purge is not using firmware retraction, it is recommended to configure it.")}
+	{% endif %}
+	
+	{% if purge_y_origin > 0 %}
+	
+	{action_respond_info("KAMP purge starting at {}, {} and purging {}mm of filament, requested flow rate is {}mm3/s.".format(
+	(purge_x_center),
+	(purge_y_origin),
+	(purge_amount),
+	(flow_rate),
+	)) }
+	
+	{% else %}
+	
+	{action_respond_info("KAMP purge starting at {}, {} and purging {}mm of filament, requested flow rate is {}mm3/s.".format(
+	(purge_x_origin),
+	(purge_y_center),
+	(purge_amount),
+	(flow_rate),
+	)) }
+	
+	{% endif %}
+	
+	SAVE_GCODE_STATE NAME=Prepurge_State
+	
+	{% if purge_y_origin > 0 %}
+	
+	G92 E0
+	G0 F{travel_speed}
+	G90
+	G0 X{purge_x_center} Y{purge_y_origin}
+	G0 Z{purge_height}
+	M83
+	G1 E{tip_distance} F{purge_move_speed}
+	G1 X{purge_x_center + purge_amount} E{purge_amount} F{purge_move_speed}
+	{RETRACT}
+	G0 X{purge_x_center + purge_amount + 10} F{travel_speed}
+	G92 E0
+	M82
+	G0 Z{purge_height * 2} F{travel_speed}
+	
+	{% else %}
+	
+	G92 E0
+	G0 F{travel_speed}
+	G90
+	G0 X{purge_x_origin} Y{purge_y_center}
+	G0 Z{purge_height}
+	M83
+	G1 E{tip_distance} F{purge_move_speed}
+	G1 Y{purge_y_center + purge_amount} E{purge_amount} F{purge_move_speed}
+	{RETRACT}
+	G0 Y{purge_y_center + purge_amount + 10} F{travel_speed}
+	G92 E0
+	M82
+	G0 Z{purge_height * 2} F{travel_speed}
+	
+	{% endif %}
+	
+	RESTORE_GCODE_STATE NAME=Prepurge_State
+	
+	{% endif %}
+
+[gcode_macro SMART_PARK]
+description = Parks your printhead near the print area for pre-print hotend heating.
+gcode = 
+	
+	{% set kamp_settings = printer["gcode_macro _KAMP_Settings"] %}
+	{% set z_height = kamp_settings.smart_park_height | float %}
+	{% set purge_margin = kamp_settings.purge_margin | float %}
+	{% set verbose_enable = kamp_settings.verbose_enable | abs %}
+	{% set center_x = printer.toolhead.axis_maximum.x / 2 | float %}
+	{% set center_y = printer.toolhead.axis_maximum.y / 2 | float %}
+	{% set axis_minimum_x = printer.toolhead.axis_minimum.x | float %}
+	{% set axis_minimum_y = printer.toolhead.axis_minimum.y | float %}
+	{% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+	{% set x_min = all_points | map(attribute=0) | min | default(center_x) %}
+	{% set y_min = all_points | map(attribute=1) | min | default(center_y) %}
+	{% set travel_speed = (printer.toolhead.max_velocity) * 60 | float %}
+	
+	{% if purge_margin > 0 and x_min != center_x and y_min != center_y %}
+	{% set x_min = [ x_min - purge_margin , x_min ] | min %}
+	{% set y_min = [ y_min - purge_margin , y_min ] | min %}
+	{% set x_min = [ x_min , axis_minimum_x ] | max %}
+	{% set y_min = [ y_min , axis_minimum_y ] | max %}
+	{% endif %}
+	
+	
+	{% if verbose_enable == True %}
+	
+	{ action_respond_info("Smart Park location: {},{}.".format(
+	(x_min),
+	(y_min),
+	)) }
+	
+	{% endif %}
+	
+	{% if printer.toolhead.position.z < z_height %}
+	G0 Z{z_height}
+	{% endif %}
+	G0 X{x_min} Y{y_min} F{travel_speed}
+	G0 Z{z_height}
+
+[gcode_macro _KAMP_Settings]
+description = This macro contains all adjustable settings for KAMP
+variable_verbose_enable = True
+variable_mesh_margin = 0
+variable_fuzz_amount = 0
+variable_probe_dock_enable = False
+variable_attach_macro = 'Attach_Probe'
+variable_detach_macro = 'Dock_Probe'
+variable_purge_height = 0.8
+variable_tip_distance = 0
+variable_purge_margin = 10
+variable_purge_amount = 30
+variable_flow_rate = 12
+variable_smart_park_height = 10
+gcode = 
+	
+	{action_respond_info(" Running the KAMP_Settings macro does nothing, it is only used for storing KAMP settings. ")}
+
+[gcode_shell_command hello_world]
+command = echo hello world
+timeout = 2.
+verbose = True
+
+[gcode_macro HELLO_WORLD]
+gcode = 
+	RUN_SHELL_COMMAND CMD=hello_world
+
+[gcode_macro _OBICO_LAYER_CHANGE]
+description = Run a scan across the current print area
+variable_first_layer_scan_retract_length = 6
+variable_first_layer_scan_retract_speed = 15
+variable_first_layer_scan_unretract_length = 6.5
+variable_first_layer_scan_unretract_speed = 15
+variable_first_layer_scan_resume_speed = 50
+variable_first_layer_scan_enabled = True
+variable_first_layer_scan_stepover = 10
+variable_first_layer_scan_speed = 10
+variable_first_layer_scan_zhop = 4
+variable_first_layer_scan_zhop_speed = 15
+variable_verbose = False
+variable_current_layer = -1
+variable_first_layer_scanning = False
+variable_wait = {'resume': "RESUME", 'absolute_coordinates': True, 'absolute_extrude': True, 'e': 0.0}
+gcode = 
+	
+	{% set pause_macro  = "PAUSE"  if printer.configfile.settings['gcode_macro pause']  is not defined
+	else printer.configfile.settings['gcode_macro pause'].rename_existing %}
+	{% set resume_macro = "RESUME" if printer.configfile.settings['gcode_macro resume'] is not defined
+	else printer.configfile.settings['gcode_macro resume'].rename_existing %}
+	
+	{% set current_layer_default = printer.print_stats.info.current_layer if printer.print_stats.info.current_layer is not none else -1 %}
+	{% set current_layer = params.CURRENT_LAYER|default(current_layer_default)|int %}
+	
+	{% set polygon_points = printer.exclude_object.objects|map(attribute='polygon')|sum(start=[]) if printer.exclude_object is defined else [] %}
+	{% set min_x = params.MINX|default(polygon_points|map(attribute=0)|min|default(printer.toolhead.axis_minimum.x))|float %}
+	{% set min_y = params.MINY|default(polygon_points|map(attribute=1)|min|default(printer.toolhead.axis_minimum.y))|float %}
+	{% set max_x = params.MAXX|default(polygon_points|map(attribute=0)|max|default(printer.toolhead.axis_maximum.x))|float %}
+	{% set max_y = params.MAXY|default(polygon_points|map(attribute=1)|max|default(printer.toolhead.axis_maximum.y))|float %}
+	
+	{% set stepoverCount = ((max_y - min_y) / first_layer_scan_stepover|float)|round(method='ceil')|int %}
+	
+	
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Layer %d" % (current_layer)}' {% endif %}
+	SET_GCODE_VARIABLE MACRO=_OBICO_LAYER_CHANGE VARIABLE=current_layer VALUE={current_layer}
+	
+	{% if first_layer_scan_enabled and current_layer == 2 %}
+	
+	{% set wait_dic = {'resume'              : resume_macro,
+	'absolute_coordinates': printer.gcode_move.absolute_coordinates,
+	'absolute_extrude'    : printer.gcode_move.absolute_extrude,
+	'e'                   : printer.gcode_move.gcode_position.e} %}
+	SET_GCODE_VARIABLE MACRO=_OBICO_LAYER_CHANGE VARIABLE=wait VALUE="{wait_dic}"
+	
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Prepair scanning" {% endif %}
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Scan Coordinates: Min:[%.3f:%.3f] Max:[%.3f:%.3f]" % (min_x,min_y,max_x,max_y)}' {% endif %}
+	{% if printer[printer.toolhead.extruder].can_extrude %}
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Retract %.1fmm filament" % first_layer_scan_retract_length|abs}' {% endif %}
+	M83
+	G0 E-{first_layer_scan_retract_length|abs} F{first_layer_scan_retract_speed|float * 60}
+	{% endif %}
+	G91
+	G0 Z{first_layer_scan_zhop|abs} F{first_layer_scan_zhop_speed|float * 60}
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Call %s" % pause_macro}' {% endif %}
+	{pause_macro}
+	
+	
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Start scanning" {% endif %}
+	
+	UPDATE_DELAYED_GCODE ID=_WAIT_OBICO_LAYER_CHANGE DURATION=1.0
+	SET_GCODE_VARIABLE MACRO=_OBICO_LAYER_CHANGE VARIABLE=first_layer_scanning VALUE=True
+	G90
+	G0 X{min_x} Y{min_y} F{first_layer_scan_resume_speed|float * 60}
+	{% for ystep in range(stepoverCount) %}
+	G0 Y{min_y + first_layer_scan_stepover|float * ystep} F{first_layer_scan_speed|float * 60}
+	G0 X{max_x if ystep % 2 == 0 else min_x}              F{first_layer_scan_speed|float * 60}
+	{% endfor %}
+	SET_GCODE_VARIABLE MACRO=_OBICO_LAYER_CHANGE VARIABLE=first_layer_scanning VALUE=False
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Finish scanning" {% endif %}
+	{% endif %}
+
+[delayed_gcode _WAIT_OBICO_LAYER_CHANGE]
+gcode = 
+	{% set lc_macro = printer['gcode_macro _OBICO_LAYER_CHANGE'] %}
+	{% if lc_macro.first_layer_scanning %}
+	
+	{% if lc_macro.verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Waiting for first layer scan..." {% endif %}
+	UPDATE_DELAYED_GCODE ID=_WAIT_OBICO_LAYER_CHANGE DURATION=1.0
+	{% else %}
+	
+	{% if lc_macro.verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Resume print" {% endif %}
+	{% if lc_macro.verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Call %s VELOCITY=%.1f" % (lc_macro.wait.resume, lc_macro.first_layer_scan_resume_speed)}' {% endif %}
+	{lc_macro.wait.resume} VELOCITY={lc_macro.first_layer_scan_resume_speed}
+	G91
+	G0 Z-{lc_macro.first_layer_scan_zhop|abs} F{lc_macro.first_layer_scan_zhop_speed|float * 60}
+	{% if printer[printer.toolhead.extruder].can_extrude %}
+	{% if lc_macro.verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Extrude %.1fmm filament" % lc_macro.first_layer_scan_unretract_length|abs}' {% endif %}
+	M83
+	G0 E{lc_macro.first_layer_scan_unretract_length|abs} F{lc_macro.first_layer_scan_unretract_speed|float * 60}
+	{% endif %}
+	
+	
+	{% if lc_macro.wait.absolute_coordinates %} G90 {% endif %}
+	{% if lc_macro.wait.absolute_extrude %}
+	M82
+	G92 E{lc_macro.wait.e}
+	{% endif %}
+	{% endif %}
+
+[exclude_object]
+
+[input_shaper]
+shaper_freq_x = 68.8
+shaper_type_x = mzv
+shaper_freq_y = 44.4
+shaper_type_y = mzv
+
+[filament_switch_sensor Filament_runout_sensor]
+pause_on_runout = False
+runout_gcode = 
+	PAUSE
+	G1 E-100 F600
+insert_gcode = 
+	
+	G1 E150 F400
+	LINE_PURGE
+	RESUME
+event_delay = 6.0
+pause_delay = 0.5
+switch_pin = PA4
+
+[bltouch]
+sensor_pin = ^PB1
+control_pin = PB0
+x_offset = -31.8
+y_offset = -40.5
+speed = 35
+samples = 3
+samples_result = median
+samples_tolerance = 0.0075
+samples_tolerance_retries = 10
+probe_with_touch_mode = true
+stow_on_each_sample = false
+z_offset = 2.010
+
+[safe_z_home]
+home_xy_position = 147, 154
+speed = 75
+z_hop = 10
+z_hop_speed = 5
+move_to_previous = true
+
+[bed_mesh]
+speed = 120
+horizontal_move_z = 8
+mesh_min = 15,15
+mesh_max = 188,186
+probe_count = 7,7
+algorithm = bicubic
+fade_start = 1
+fade_end = 10
+fade_target = 0
+
+[stepper_x]
+step_pin = PC2
+dir_pin = PB9
+enable_pin = !PC3
+microsteps = 16
+rotation_distance = 40
+endstop_pin = ^PA5
+position_endstop = 0
+position_max = 250
+homing_speed = 50
+
+[stepper_y]
+step_pin = PB8
+dir_pin = PB7
+enable_pin = !PC3
+microsteps = 16
+rotation_distance = 40
+endstop_pin = ^PA6
+position_endstop = 0
+position_max = 250
+homing_speed = 50
+
+[stepper_z]
+step_pin = PB6
+dir_pin = !PB5
+enable_pin = !PC3
+microsteps = 16
+rotation_distance = 8
+endstop_pin = probe:z_virtual_endstop
+position_max = 240
+position_min = -2
+
+[extruder]
+max_extrude_only_distance = 100.0
+step_pin = PB4
+dir_pin = PB3
+enable_pin = !PC3
+microsteps = 16
+gear_ratio = 42:12
+rotation_distance = 26.359
+nozzle_diameter = 0.400
+filament_diameter = 1.750
+heater_pin = PA1
+sensor_type = EPCOS 100K B57560G104F
+sensor_pin = PC5
+min_temp = 0
+max_temp = 300
+min_extrude_temp = 170
+max_extrude_cross_section = 5
+pressure_advance = .0465
+pressure_advance_smooth_time = 0.04
+control = pid
+pid_kp = 20.336
+pid_ki = 0.990
+pid_kd = 104.478
+
+[heater_bed]
+heater_pin = PA2
+sensor_type = EPCOS 100K B57560G104F
+sensor_pin = PC4
+min_temp = 0
+max_temp = 130
+control = pid
+pid_kp = 72.521
+pid_ki = 1.070
+pid_kd = 1229.226
+
+[fan]
+pin = PA0
+
+[mcu]
+serial = /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+restart_method = command
+
+[printer]
+kinematics = cartesian
+max_velocity = 300
+max_accel = 3500
+max_accel_to_decel = 3500
+max_z_velocity = 5
+max_z_accel = 100
+square_corner_velocity = 5
+
+[bed_screws]
+screw1 = 25, 205
+screw1_name = rear left screw
+screw2 = 195, 205
+screw2_name = rear right screw
+screw3 = 195, 35
+screw3_name = front right screw
+screw4 = 25, 35
+screw4_name = front left screw
+
+[screws_tilt_adjust]
+screw1 = 57, 229
+screw1_name = rear left screw
+screw2 = 227, 229
+screw2_name = rear right screw
+screw3 = 227, 70
+screw3_name = front right screw
+screw4 = 57, 70
+screw4_name = front left screw
+horizontal_move_z = 10
+speed = 50
+screw_thread = CW-M3
+
+[temperature_sensor raspberry_pi]
+sensor_type = temperature_host
+min_temp = 10
+max_temp = 120
+
+[firmware_retraction]
+retract_length = 0.6
+retract_speed = 85
+unretract_extra_length = 0
+unretract_speed = 40
+
+[bed_mesh default]
+version = 1
+points = 
+	-0.250000, -0.245000, -0.190000, -0.167500
+	-0.055000, -0.037500, 0.015000, 0.077500
+	0.115000, 0.150000, 0.225000, 0.267500
+x_count = 4
+y_count = 3
+mesh_x_pps = 2
+mesh_y_pps = 2
+algo = lagrange
+tension = 0.2
+min_x = 68.46000000000001
+max_x = 151.51999999999998
+min_y = 82.59
+max_y = 137.41
+=======================
+Extruder max_extrude_ratio=2.078758
+mcu 'mcu': Starting serial connect
+webhooks client 140734772518416: New connection
+webhooks client 140734772518416: Client info {'program': 'Moonraker', 'version': 'v0.8.0-309-gf946e6a'}
+mcu 'mcu': got {'oid': 16, 'next_clock': 3964492288, 'value': 31271, '#name': 'analog_in_state', '#sent_time': 117753.63828009099, '#receive_time': 117753.659558776}
+mcu 'mcu': got {'oid': 12, 'next_clock': 3983212288, 'value': 31158, '#name': 'analog_in_state', '#sent_time': 117753.90656262799, '#receive_time': 117753.91956905401}
+mcu 'mcu': got {'oid': 16, 'next_clock': 3986092288, 'value': 31269, '#name': 'analog_in_state', '#sent_time': 117753.90656262799, '#receive_time': 117753.95956998}
+Loaded MCU 'mcu' 112 commands (v0.12.0-25-g99d7af87 / gcc: (15:12.2.rel1-1) 12.2.1 20221205 binutils: (2.39-8+rpi1+18) 2.39)
+MCU 'mcu' config: ADC_MAX=4095 BUS_PINS_i2c1=PB6,PB7 BUS_PINS_i2c1a=PB8,PB9 BUS_PINS_i2c2=PB10,PB11 BUS_PINS_spi1=PA6,PA7,PA5 BUS_PINS_spi1a=PB4,PB5,PB3 BUS_PINS_spi2=PB14,PB15,PB13 BUS_PINS_spi3=PB4,PB5,PB3 CLOCK_FREQ=72000000 MCU=stm32f103xe PWM_MAX=255 RECEIVE_WINDOW=192 RESERVE_PINS_serial=PA10,PA9 SERIAL_BAUD=250000 STATS_SUMSQ_BASE=256 STEPPER_BOTH_EDGE=1
+Configured MCU 'mcu' (1024 moves)
+bed_mesh: generated points
+Index |  Tool Adjusted  |   Probe
+  0   | (46.8, 55.5)    | (15.0, 15.0)
+  1   | (75.6, 55.5)    | (43.8, 15.0)
+  2   | (104.5, 55.5)   | (72.7, 15.0)
+  3   | (133.3, 55.5)   | (101.5, 15.0)
+  4   | (162.1, 55.5)   | (130.3, 15.0)
+  5   | (190.9, 55.5)   | (159.1, 15.0)
+  6   | (219.8, 55.5)   | (188.0, 15.0)
+  7   | (219.8, 84.0)   | (188.0, 43.5)
+  8   | (190.9, 84.0)   | (159.1, 43.5)
+  9   | (162.1, 84.0)   | (130.3, 43.5)
+  10  | (133.3, 84.0)   | (101.5, 43.5)
+  11  | (104.5, 84.0)   | (72.7, 43.5)
+  12  | (75.6, 84.0)    | (43.8, 43.5)
+  13  | (46.8, 84.0)    | (15.0, 43.5)
+  14  | (46.8, 112.5)   | (15.0, 72.0)
+  15  | (75.6, 112.5)   | (43.8, 72.0)
+  16  | (104.5, 112.5)  | (72.7, 72.0)
+  17  | (133.3, 112.5)  | (101.5, 72.0)
+  18  | (162.1, 112.5)  | (130.3, 72.0)
+  19  | (190.9, 112.5)  | (159.1, 72.0)
+  20  | (219.8, 112.5)  | (188.0, 72.0)
+  21  | (219.8, 141.0)  | (188.0, 100.5)
+  22  | (190.9, 141.0)  | (159.1, 100.5)
+  23  | (162.1, 141.0)  | (130.3, 100.5)
+  24  | (133.3, 141.0)  | (101.5, 100.5)
+  25  | (104.5, 141.0)  | (72.7, 100.5)
+  26  | (75.6, 141.0)   | (43.8, 100.5)
+  27  | (46.8, 141.0)   | (15.0, 100.5)
+  28  | (46.8, 169.5)   | (15.0, 129.0)
+  29  | (75.6, 169.5)   | (43.8, 129.0)
+  30  | (104.5, 169.5)  | (72.7, 129.0)
+  31  | (133.3, 169.5)  | (101.5, 129.0)
+  32  | (162.1, 169.5)  | (130.3, 129.0)
+  33  | (190.9, 169.5)  | (159.1, 129.0)
+  34  | (219.8, 169.5)  | (188.0, 129.0)
+  35  | (219.8, 198.0)  | (188.0, 157.5)
+  36  | (190.9, 198.0)  | (159.1, 157.5)
+  37  | (162.1, 198.0)  | (130.3, 157.5)
+  38  | (133.3, 198.0)  | (101.5, 157.5)
+  39  | (104.5, 198.0)  | (72.7, 157.5)
+  40  | (75.6, 198.0)   | (43.8, 157.5)
+  41  | (46.8, 198.0)   | (15.0, 157.5)
+  42  | (46.8, 226.5)   | (15.0, 186.0)
+  43  | (75.6, 226.5)   | (43.8, 186.0)
+  44  | (104.5, 226.5)  | (72.7, 186.0)
+  45  | (133.3, 226.5)  | (101.5, 186.0)
+  46  | (162.1, 226.5)  | (130.3, 186.0)
+  47  | (190.9, 226.5)  | (159.1, 186.0)
+  48  | (219.8, 226.5)  | (188.0, 186.0)
+Starting heater checks for heater_bed
+Starting heater checks for extruder
+webhooks: registering remote method 'shutdown_machine' for connection id: 140734772518416
+webhooks: registering remote method 'reboot_machine' for connection id: 140734772518416
+webhooks: registering remote method 'pause_job_queue' for connection id: 140734772518416
+webhooks: registering remote method 'start_job_queue' for connection id: 140734772518416
+Resetting prediction variance 118368.866: freq=72000354 diff=-8589952819 stddev=20014.473
+Resetting prediction variance 118369.851: freq=45647599 diff=-3224277402 stddev=72000.000
+Resetting prediction variance 118370.835: freq=39411549 diff=-1922860199 stddev=72000.000
+Resetting prediction variance 118371.820: freq=36670963 diff=-1327794809 stddev=72000.000
+Resetting prediction variance 118372.804: freq=35161888 diff=-981678982 stddev=72000.000
+Resetting prediction variance 118373.789: freq=34228679 diff=-752103631 stddev=72000.000
+Resetting prediction variance 118374.773: freq=33611171 diff=-586557706 stddev=72000.000
+Resetting prediction variance 118375.757: freq=33185542 diff=-459981529 stddev=72000.000
+Resetting prediction variance 118376.741: freq=32885383 diff=-358964211 stddev=72000.000
+Resetting prediction variance 118377.726: freq=32671866 diff=-275590730 stddev=72000.000
+Resetting prediction variance 118378.711: freq=32520809 diff=-205030063 stddev=72000.000
+Resetting prediction variance 118379.696: freq=32416322 diff=-144113793 stddev=72000.000
+Resetting prediction variance 118380.680: freq=32347526 diff=-90534305 stddev=72000.000
+Resetting prediction variance 118381.664: freq=32306786 diff=-42865683 stddev=72000.000
+Resetting prediction variance 118393.479: freq=32288528 diff=430167353 stddev=71634.829
+Resetting prediction variance 118394.466: freq=32466746 diff=430555141 stddev=72000.000
+Resetting prediction variance 118395.448: freq=32636688 diff=432323621 stddev=72000.000
+Resetting prediction variance 118396.433: freq=32799919 diff=435447865 stddev=72000.000
+Resetting prediction variance 118397.419: freq=32957768 diff=439570466 stddev=72000.000
+Resetting prediction variance 118407.192: freq=33111250 diff=835825883 stddev=72000.000
+Resetting prediction variance 118877.667: freq=33411385 diff=-11189801771 stddev=72000.000
+Resetting prediction variance 118878.653: freq=24037739 diff=-5347257762 stddev=72000.000
+Resetting prediction variance 118879.638: freq=21018673 diff=-3427731251 stddev=72000.000
+Resetting prediction variance 118880.622: freq=19547018 diff=-2463618151 stddev=72000.000
+Resetting prediction variance 118881.607: freq=18688118 diff=-1877881528 stddev=72000.000
+Resetting prediction variance 118882.591: freq=18134047 diff=-1480353553 stddev=72000.000
+Resetting prediction variance 118883.576: freq=17753728 diff=-1190180621 stddev=72000.000
+Resetting prediction variance 118884.561: freq=17481894 diff=-967135522 stddev=72000.000
+Resetting prediction variance 118885.545: freq=17282384 diff=-788759012 stddev=72000.000
+Resetting prediction variance 118886.530: freq=17133576 diff=-641835992 stddev=72000.000
+Resetting prediction variance 118887.514: freq=17021713 diff=-517807347 stddev=72000.000
+Resetting prediction variance 118888.498: freq=16937648 diff=-411025314 stddev=72000.000
+Resetting prediction variance 118889.483: freq=16875053 diff=-317538114 stddev=72000.000
+Resetting prediction variance 118890.467: freq=16829423 diff=-234654378 stddev=72000.000
+Resetting prediction variance 118891.452: freq=16797442 diff=-160221800 stddev=72000.000
+Resetting prediction variance 118892.436: freq=16776639 diff=-92830961 stddev=72000.000
+Resetting prediction variance 118893.421: freq=16765112 diff=-31187394 stddev=72000.000
+Resetting prediction variance 118894.405: freq=16761395 diff=25502022 stddev=72000.000
+Resetting prediction variance 118895.389: freq=16764321 diff=78025335 stddev=72000.000
+Resetting prediction variance 118896.374: freq=16772961 diff=126999558 stddev=72000.000
+Resetting prediction variance 118897.358: freq=16786571 diff=172773269 stddev=72000.000
+Resetting prediction variance 118898.343: freq=16804530 diff=215869220 stddev=72000.000
+Resetting prediction variance 118899.327: freq=16826337 diff=256457202 stddev=72000.000
+Resetting prediction variance 118900.311: freq=16851565 diff=294873497 stddev=72000.000
+Resetting prediction variance 118901.295: freq=16879860 diff=331339681 stddev=72000.000
+Resetting prediction variance 118902.279: freq=16910923 diff=366042947 stddev=72000.000
+Resetting prediction variance 118903.264: freq=16944500 diff=399208157 stddev=72000.000
+Resetting prediction variance 118904.249: freq=16980380 diff=430905841 stddev=72000.000
+Resetting prediction variance 118905.234: freq=17018375 diff=461194679 stddev=72000.000
+Resetting prediction variance 118906.218: freq=17058319 diff=490303762 stddev=72000.000
+Resetting prediction variance 118907.203: freq=17100078 diff=518254459 stddev=72000.000
+Resetting prediction variance 118908.188: freq=17143528 diff=545134354 stddev=72000.000
+Resetting prediction variance 118909.172: freq=17188563 diff=570949883 stddev=72000.000
+Resetting prediction variance 118910.157: freq=17235086 diff=595891807 stddev=72000.000
+Resetting prediction variance 118911.142: freq=17283018 diff=619889681 stddev=72000.000
+Resetting prediction variance 118912.126: freq=17332284 diff=643057735 stddev=72000.000
+Resetting prediction variance 118913.110: freq=17382820 diff=665446748 stddev=72000.000
+Resetting prediction variance 118914.094: freq=17434571 diff=687146996 stddev=72000.000
+Resetting prediction variance 118915.078: freq=17487491 diff=708071754 stddev=72000.000
+Resetting prediction variance 118916.062: freq=17541532 diff=728319540 stddev=72000.000
+Resetting prediction variance 118917.047: freq=17596656 diff=747920150 stddev=72000.000
+Resetting prediction variance 118918.031: freq=17652828 diff=766966580 stddev=72000.000
+Resetting prediction variance 118919.015: freq=17710024 diff=785355578 stddev=72000.000
+Resetting prediction variance 118920.000: freq=17768213 diff=803174748 stddev=72000.000
+Resetting prediction variance 118920.984: freq=17827373 diff=820444226 stddev=72000.000
+Resetting prediction variance 118921.968: freq=17887482 diff=837197602 stddev=72000.000
+Resetting prediction variance 118922.953: freq=17948525 diff=853494584 stddev=72000.000
+Resetting prediction variance 118923.937: freq=18010492 diff=869236746 stddev=72000.000
+Resetting prediction variance 118924.921: freq=18073365 diff=884504275 stddev=72000.000
+Resetting prediction variance 118925.905: freq=18137135 diff=899310227 stddev=72000.000
+Resetting prediction variance 118926.889: freq=18201794 diff=913672822 stddev=72000.000
+Resetting prediction variance 118927.873: freq=18267336 diff=927603260 stddev=72000.000
+Resetting prediction variance 118928.858: freq=18333756 diff=941117715 stddev=72000.000
+Resetting prediction variance 118929.842: freq=18401052 diff=954227500 stddev=72000.000
+Resetting prediction variance 118930.826: freq=18469224 diff=966981936 stddev=72000.000
+Resetting prediction variance 118931.811: freq=18538274 diff=979302730 stddev=72000.000
+Resetting prediction variance 118932.795: freq=18608201 diff=991304447 stddev=72000.000
+Resetting prediction variance 118933.779: freq=18679013 diff=1002874862 stddev=72000.000
+Resetting prediction variance 118934.763: freq=18750709 diff=1014086718 stddev=72000.000
+Resetting prediction variance 118935.747: freq=18823294 diff=1024950598 stddev=72000.000
+Resetting prediction variance 118936.732: freq=18896775 diff=1035473910 stddev=72000.000
+Resetting prediction variance 118937.716: freq=18971161 diff=1045666347 stddev=72000.000
+Resetting prediction variance 118938.700: freq=19046461 diff=1055533194 stddev=72000.000
+Resetting prediction variance 118939.684: freq=19122685 diff=1065143633 stddev=72000.000
+Resetting prediction variance 118940.669: freq=19199849 diff=1074378717 stddev=72000.000
+Resetting prediction variance 118941.654: freq=19277962 diff=1083358816 stddev=72000.000
+Resetting prediction variance 118942.638: freq=19357039 diff=1092052783 stddev=72000.000
+Resetting prediction variance 118943.623: freq=19437098 diff=1100388483 stddev=72000.000
+Resetting prediction variance 118944.608: freq=19518148 diff=1108487166 stddev=72000.000
+Resetting prediction variance 118945.593: freq=19600210 diff=1116309082 stddev=72000.000
+Resetting prediction variance 118946.578: freq=19683302 diff=1123857622 stddev=72000.000
+Resetting prediction variance 118947.562: freq=19767443 diff=1131086432 stddev=72000.000
+Resetting prediction variance 118948.547: freq=19852648 diff=1138099133 stddev=72000.000
+Resetting prediction variance 118949.532: freq=19938943 diff=1144854618 stddev=72000.000
+Resetting prediction variance 118950.516: freq=20026347 diff=1151290024 stddev=72000.000
+Resetting prediction variance 118951.500: freq=20114880 diff=1157477473 stddev=72000.000
+Resetting prediction variance 118952.484: freq=20204565 diff=1163421476 stddev=72000.000
+Resetting prediction variance 118953.468: freq=20295426 diff=1169125022 stddev=72000.000
+Resetting prediction variance 118954.453: freq=20387489 diff=1174599228 stddev=72000.000
+Resetting prediction variance 118955.437: freq=20480783 diff=1179837918 stddev=72000.000
+Resetting prediction variance 118956.421: freq=20575333 diff=1184900815 stddev=72000.000
+Resetting prediction variance 118957.406: freq=20671174 diff=1189665164 stddev=72000.000
+Resetting prediction variance 118958.390: freq=20768330 diff=1194224198 stddev=72000.000
+Resetting prediction variance 118959.375: freq=20866832 diff=1198615649 stddev=72000.000
+Resetting prediction variance 118960.360: freq=20966718 diff=1202845886 stddev=72000.000
+Resetting prediction variance 118961.344: freq=21068025 diff=1206747199 stddev=72000.000
+Resetting prediction variance 118962.329: freq=21170775 diff=1210491266 stddev=72000.000
+Resetting prediction variance 118963.314: freq=21275010 diff=1214027299 stddev=72000.000
+Resetting prediction variance 118964.298: freq=21380765 diff=1217304605 stddev=72000.000
+Resetting prediction variance 118965.282: freq=21488071 diff=1220383117 stddev=72000.000
+Resetting prediction variance 118966.267: freq=21596965 diff=1223259664 stddev=72000.000
+Resetting prediction variance 118967.251: freq=21707486 diff=1225939572 stddev=72000.000
+Resetting prediction variance 118968.235: freq=21819675 diff=1228428972 stddev=72000.000
+Resetting prediction variance 118969.220: freq=21933571 diff=1230777259 stddev=72000.000
+Resetting prediction variance 118970.204: freq=22049224 diff=1232885384 stddev=72000.000
+Resetting prediction variance 118971.189: freq=22166669 diff=1234862882 stddev=72000.000
+Resetting prediction variance 118972.173: freq=22285957 diff=1236593254 stddev=72000.000
+Resetting prediction variance 118973.157: freq=22407125 diff=1238142201 stddev=72000.000
+Resetting prediction variance 118974.141: freq=22530219 diff=1239509160 stddev=72000.000
+Resetting prediction variance 118975.126: freq=22655287 diff=1240764121 stddev=72000.000
+Resetting prediction variance 118976.110: freq=22782382 diff=1241768025 stddev=72000.000
+Resetting prediction variance 118977.094: freq=22911545 diff=1242595637 stddev=72000.000
+Resetting prediction variance 118978.078: freq=23042827 diff=1243249354 stddev=72000.000
+Resetting prediction variance 118979.062: freq=23176276 diff=1243728321 stddev=72000.000
+Resetting prediction variance 118980.047: freq=23311945 diff=1244040564 stddev=72000.000
+Resetting prediction variance 118981.031: freq=23449886 diff=1244234594 stddev=72000.000
+Resetting prediction variance 118982.015: freq=23590157 diff=1244192193 stddev=72000.000
+Resetting prediction variance 118983.000: freq=23732805 diff=1243982477 stddev=72000.000
+Resetting prediction variance 118983.984: freq=23877885 diff=1243664405 stddev=72000.000
+Resetting prediction variance 118984.968: freq=24025458 diff=1243116209 stddev=72000.000
+Resetting prediction variance 118985.953: freq=24175573 diff=1242401818 stddev=72000.000
+Resetting prediction variance 118986.938: freq=24328285 diff=1241570414 stddev=72000.000
+Resetting prediction variance 118987.923: freq=24483659 diff=1240571980 stddev=72000.000
+Resetting prediction variance 118988.907: freq=24641754 diff=1239356780 stddev=72000.000
+Resetting prediction variance 118989.891: freq=24802616 diff=1237977835 stddev=72000.000
+Resetting prediction variance 118990.875: freq=24966304 diff=1236434581 stddev=72000.000
+Resetting prediction variance 118991.860: freq=25132875 diff=1234775633 stddev=72000.000
+Resetting prediction variance 118992.845: freq=25302398 diff=1232957539 stddev=72000.000
+Resetting prediction variance 118993.829: freq=25474932 diff=1230970391 stddev=72000.000
+Resetting prediction variance 118994.814: freq=25650536 diff=1228762738 stddev=72000.000
+Resetting prediction variance 118995.798: freq=25829257 diff=1226393172 stddev=72000.000
+Resetting prediction variance 118996.782: freq=26011154 diff=1223860932 stddev=72000.000
+Resetting prediction variance 118997.766: freq=26196285 diff=1221166488 stddev=72000.000
+Resetting prediction variance 118998.751: freq=26384709 diff=1218371979 stddev=72000.000
+Resetting prediction variance 118999.735: freq=26576494 diff=1215347349 stddev=72000.000
+Resetting prediction variance 119000.720: freq=26771686 diff=1212164735 stddev=72000.000
+Resetting prediction variance 119001.704: freq=26970344 diff=1208867009 stddev=72000.000
+Resetting prediction variance 119002.689: freq=27172533 diff=1205412650 stddev=72000.000
+Resetting prediction variance 119003.674: freq=27378309 diff=1201731334 stddev=72000.000
+Resetting prediction variance 119004.658: freq=27587716 diff=1197950450 stddev=72000.000
+Resetting prediction variance 119005.642: freq=27800816 diff=1193948135 stddev=72000.000
+Resetting prediction variance 119006.626: freq=28017649 diff=1189781688 stddev=72000.000
+Resetting prediction variance 119007.610: freq=28238266 diff=1185455963 stddev=72000.000
+Resetting prediction variance 119008.595: freq=28462716 diff=1180966285 stddev=72000.000
+Resetting prediction variance 119009.579: freq=28691046 diff=1176319186 stddev=72000.000
+Resetting prediction variance 119010.564: freq=28923303 diff=1171552802 stddev=72000.000
+Resetting prediction variance 119011.548: freq=29159544 diff=1166582194 stddev=72000.000
+Resetting prediction variance 119012.532: freq=29399798 diff=1161497212 stddev=72000.000
+Resetting prediction variance 119013.516: freq=29644113 diff=1156190830 stddev=72000.000
+Resetting prediction variance 119014.501: freq=29892514 diff=1150721796 stddev=72000.000
+Resetting prediction variance 119015.485: freq=30145035 diff=1145093813 stddev=72000.000
+Resetting prediction variance 119016.469: freq=30401707 diff=1139303874 stddev=72000.000
+Resetting prediction variance 119017.454: freq=30662558 diff=1133398665 stddev=72000.000
+Resetting prediction variance 119018.438: freq=30927630 diff=1127286479 stddev=72000.000
+Resetting prediction variance 119019.422: freq=31196927 diff=1121012167 stddev=72000.000
+Resetting prediction variance 119020.406: freq=31470467 diff=1114579253 stddev=72000.000
+Resetting prediction variance 119021.390: freq=31748264 diff=1107984563 stddev=72000.000
+Resetting prediction variance 119022.374: freq=32030329 diff=1101230849 stddev=72000.000
+Resetting prediction variance 119023.359: freq=32316668 diff=1094375167 stddev=72000.000
+Resetting prediction variance 119024.343: freq=32607302 diff=1087299597 stddev=72000.000
+Resetting prediction variance 119025.327: freq=32902210 diff=1080070580 stddev=72000.000
+Resetting prediction variance 119026.312: freq=33201384 diff=1072729534 stddev=72000.000
+Resetting prediction variance 119027.297: freq=33504832 diff=1065230253 stddev=72000.000
+Resetting prediction variance 119028.281: freq=33812537 diff=1057535158 stddev=72000.000
+Resetting prediction variance 119029.265: freq=34124457 diff=1049685529 stddev=72000.000
+Resetting prediction variance 119030.249: freq=34440564 diff=1041691491 stddev=72000.000
+Resetting prediction variance 119031.234: freq=34760826 diff=1033551648 stddev=72000.000
+Resetting prediction variance 119032.218: freq=35085207 diff=1025267473 stddev=72000.000
+Resetting prediction variance 119033.202: freq=35413662 diff=1016838917 stddev=72000.000
+Resetting prediction variance 119034.186: freq=35746143 diff=1008321098 stddev=72000.000
+Resetting prediction variance 119035.170: freq=36082613 diff=999605027 stddev=72000.000
+Resetting prediction variance 119036.154: freq=36422991 diff=990748516 stddev=72000.000
+Resetting prediction variance 119037.139: freq=36767210 diff=981746623 stddev=72000.000
+Resetting prediction variance 119038.124: freq=37115198 diff=972722743 stddev=72000.000
+Resetting prediction variance 119039.109: freq=37466922 diff=963503988 stddev=72000.000
+Resetting prediction variance 119040.094: freq=37822271 diff=954155143 stddev=72000.000
+Resetting prediction variance 119041.078: freq=38181153 diff=944642369 stddev=72000.000
+Resetting prediction variance 119042.063: freq=38543447 diff=935013714 stddev=72000.000
+Resetting prediction variance 119043.047: freq=38909049 diff=925273628 stddev=72000.000
+Resetting prediction variance 119044.031: freq=39277850 diff=915419029 stddev=72000.000
+Resetting prediction variance 119045.015: freq=39649734 diff=905458795 stddev=72000.000
+Resetting prediction variance 119045.999: freq=40024582 diff=895392735 stddev=72000.000
+Resetting prediction variance 119046.983: freq=40402265 diff=885224443 stddev=72000.000
+Resetting prediction variance 119047.967: freq=40782652 diff=874962822 stddev=72000.000
+Resetting prediction variance 119048.951: freq=41165605 diff=864610254 stddev=72000.000
+Resetting prediction variance 119049.936: freq=41550981 diff=854219134 stddev=72000.000
+Resetting prediction variance 119050.920: freq=41938660 diff=843689210 stddev=72000.000
+Resetting prediction variance 119051.904: freq=42328459 diff=833082545 stddev=72000.000
+Resetting prediction variance 119052.888: freq=42720219 diff=822409205 stddev=72000.000
+Resetting prediction variance 119053.873: freq=43113780 diff=811698737 stddev=72000.000
+Resetting prediction variance 119054.857: freq=43509001 diff=800893297 stddev=72000.000
+Resetting prediction variance 119055.841: freq=43905685 diff=790029642 stddev=72000.000
+Resetting prediction variance 119056.825: freq=44303656 diff=779117892 stddev=72000.000
+Resetting prediction variance 119057.810: freq=44702739 diff=768145730 stddev=72000.000
+Resetting prediction variance 119058.794: freq=45102750 diff=757198134 stddev=72000.000
+Resetting prediction variance 119059.779: freq=45503542 diff=746134619 stddev=72000.000
+Resetting prediction variance 119060.763: freq=45904889 diff=735069328 stddev=72000.000
+Resetting prediction variance 119061.747: freq=46306611 diff=723982315 stddev=72000.000
+Resetting prediction variance 119062.731: freq=46708522 diff=712873628 stddev=72000.000
+Resetting prediction variance 119063.716: freq=47110427 diff=701789959 stddev=72000.000
+Resetting prediction variance 119064.701: freq=47512167 diff=690683763 stddev=72000.000
+Resetting prediction variance 119065.686: freq=47913546 diff=679576911 stddev=72000.000
+Resetting prediction variance 119066.670: freq=48314372 diff=668445834 stddev=72000.000
+Resetting prediction variance 119067.655: freq=48714426 diff=657353840 stddev=72000.000
+Resetting prediction variance 119068.640: freq=49113545 diff=646280337 stddev=72000.000
+Resetting prediction variance 119069.624: freq=49511541 diff=635200855 stddev=72000.000
+Resetting prediction variance 119070.608: freq=49908196 diff=624144702 stddev=72000.000
+Resetting prediction variance 119071.593: freq=50303325 diff=613178419 stddev=72000.000
+Resetting prediction variance 119072.577: freq=50696783 diff=602197872 stddev=72000.000
+Resetting prediction variance 119073.561: freq=51088350 diff=591265104 stddev=72000.000
+Resetting prediction variance 119074.545: freq=51477852 diff=580377707 stddev=72000.000
+Resetting prediction variance 119075.529: freq=51865112 diff=569551066 stddev=72000.000
+Resetting prediction variance 119076.513: freq=52249962 diff=558753321 stddev=72000.000
+Resetting prediction variance 119077.498: freq=52632223 diff=548073628 stddev=72000.000
+Resetting prediction variance 119078.483: freq=53011773 diff=537462061 stddev=72000.000
+Resetting prediction variance 119079.468: freq=53388451 diff=526924212 stddev=72000.000
+Resetting prediction variance 119080.453: freq=53762104 diff=516461308 stddev=72000.000
+Resetting prediction variance 119081.438: freq=54132580 diff=506084199 stddev=72000.000
+Resetting prediction variance 119082.423: freq=54499737 diff=495794765 stddev=72000.000
+Resetting prediction variance 119083.408: freq=54863437 diff=485597104 stddev=72000.000
+Resetting prediction variance 119084.393: freq=55223548 diff=475491146 stddev=72000.000
+Resetting prediction variance 119085.377: freq=55579939 diff=465465793 stddev=72000.000
+Resetting prediction variance 119086.361: freq=55932467 diff=455548570 stddev=72000.000
+Resetting prediction variance 119087.346: freq=56281019 diff=445766322 stddev=72000.000
+Resetting prediction variance 119088.330: freq=56625520 diff=436059229 stddev=72000.000
+Resetting prediction variance 119089.314: freq=56965833 diff=426458222 stddev=72000.000
+Resetting prediction variance 119090.299: freq=57301859 diff=416973697 stddev=72000.000
+Resetting prediction variance 119091.284: freq=57633510 diff=407632138 stddev=72000.000
+Resetting prediction variance 119092.268: freq=57960732 diff=398438395 stddev=72000.000
+Resetting prediction variance 119093.253: freq=58283465 diff=389301537 stddev=72000.000
+Resetting prediction variance 119094.237: freq=58601584 diff=380323383 stddev=72000.000
+Resetting prediction variance 119095.221: freq=58915047 diff=371474785 stddev=72000.000
+Resetting prediction variance 119096.205: freq=59223801 diff=362809971 stddev=72000.000
+Resetting prediction variance 119097.189: freq=59527839 diff=354219492 stddev=72000.000
+Resetting prediction variance 119098.173: freq=59827069 diff=345758584 stddev=72000.000
+Resetting prediction variance 119099.158: freq=60121452 diff=337451570 stddev=72000.000
+Resetting prediction variance 119100.142: freq=60410980 diff=329267244 stddev=72000.000
+Resetting prediction variance 119101.127: freq=60695607 diff=321201002 stddev=72000.000
+Resetting prediction variance 119102.111: freq=60975300 diff=313283343 stddev=72000.000
+Resetting prediction variance 119103.095: freq=61250052 diff=305485074 stddev=72000.000
+Resetting prediction variance 119104.081: freq=61519841 diff=297861123 stddev=72000.000
+Resetting prediction variance 119105.065: freq=61784699 diff=290418636 stddev=72000.000
+Resetting prediction variance 119106.050: freq=62044657 diff=283068808 stddev=72000.000
+Resetting prediction variance 119107.035: freq=62299688 diff=275853405 stddev=72000.000
+Resetting prediction variance 119108.020: freq=62549798 diff=268718703 stddev=72000.000
+Resetting prediction variance 119109.005: freq=62794949 diff=261782001 stddev=72000.000
+Resetting prediction variance 119109.989: freq=63035215 diff=255007284 stddev=72000.000
+Resetting prediction variance 119110.973: freq=63270636 diff=248320772 stddev=72000.000
+Resetting prediction variance 119111.958: freq=63501194 diff=241774379 stddev=72000.000
+Resetting prediction variance 119112.942: freq=63726924 diff=235369280 stddev=72000.000
+Resetting prediction variance 119113.926: freq=63947865 diff=229101110 stddev=72000.000
+Resetting prediction variance 119114.910: freq=64164058 diff=222969215 stddev=72000.000
+Resetting prediction variance 119115.894: freq=64375548 diff=217025155 stddev=72000.000
+Resetting prediction variance 119116.879: freq=64582432 diff=211112986 stddev=72000.000
+Resetting prediction variance 119117.864: freq=64784666 diff=205391215 stddev=72000.000
+Resetting prediction variance 119118.848: freq=64982358 diff=199815126 stddev=72000.000
+Resetting prediction variance 119119.833: freq=65175576 diff=194302657 stddev=72000.000
+Resetting prediction variance 119120.817: freq=65364310 diff=188919171 stddev=72000.000
+Resetting prediction variance 119121.802: freq=65548622 diff=183704824 stddev=72000.000
+Resetting prediction variance 119122.787: freq=65728612 diff=178621622 stddev=72000.000
+Resetting prediction variance 119123.771: freq=65904351 diff=173590643 stddev=72000.000
+Resetting prediction variance 119124.755: freq=66075831 diff=168719190 stddev=72000.000
+Resetting prediction variance 119125.739: freq=66243153 diff=163964934 stddev=72000.000
+Resetting prediction variance 119126.723: freq=66406379 diff=159326805 stddev=72000.000
+Resetting prediction variance 119127.708: freq=66565576 diff=154856460 stddev=72000.000
+Resetting prediction variance 119128.692: freq=66720864 diff=150439052 stddev=72000.000
+Resetting prediction variance 119129.676: freq=66872251 diff=146100146 stddev=72000.000
+Resetting prediction variance 119130.660: freq=67019775 diff=141893171 stddev=72000.000
+Resetting prediction variance 119131.645: freq=67163527 diff=137805619 stddev=72000.000
+Resetting prediction variance 119132.629: freq=67303588 diff=133873014 stddev=72000.000
+Resetting prediction variance 119133.614: freq=67440078 diff=129993294 stddev=72000.000
+Resetting prediction variance 119134.599: freq=67573020 diff=126213160 stddev=72000.000
+Resetting prediction variance 119135.584: freq=67702481 diff=122538716 stddev=72000.000
+Resetting prediction variance 119136.569: freq=67828537 diff=118956299 stddev=72000.000
+Resetting prediction variance 119137.554: freq=67951251 diff=115413650 stddev=72000.000
+Resetting prediction variance 119138.539: freq=68070636 diff=112020012 stddev=72000.000
+Resetting prediction variance 119139.524: freq=68186818 diff=108718142 stddev=72000.000
+Resetting prediction variance 119140.509: freq=68299865 diff=105514259 stddev=72000.000
+Resetting prediction variance 119141.493: freq=68409854 diff=102380257 stddev=72000.000
+Resetting prediction variance 119142.477: freq=68516833 diff=99336190 stddev=72000.000
+Resetting prediction variance 119143.461: freq=68620871 diff=96413162 stddev=72000.000
+Resetting prediction variance 119144.446: freq=68722078 diff=93530203 stddev=72000.000
+Resetting prediction variance 119145.431: freq=68820477 diff=90734991 stddev=72000.000
+Resetting prediction variance 119146.416: freq=68916141 diff=88012559 stddev=72000.000
+Resetting prediction variance 119147.401: freq=69009129 diff=85366375 stddev=72000.000
+Resetting prediction variance 119148.386: freq=69099505 diff=82768332 stddev=72000.000
+Resetting prediction variance 119149.371: freq=69187301 diff=80282594 stddev=72000.000
+Resetting prediction variance 119150.355: freq=69272622 diff=77815816 stddev=72000.000
+Resetting prediction variance 119151.340: freq=69355474 diff=75490003 stddev=72000.000
+Resetting prediction variance 119152.324: freq=69435994 diff=73158035 stddev=72000.000
+Resetting prediction variance 119153.309: freq=69514161 diff=70966418 stddev=72000.000
+Resetting prediction variance 119154.293: freq=69590114 diff=68805274 stddev=72000.000
+Resetting prediction variance 119155.277: freq=69663873 diff=66701508 stddev=72000.000
+Resetting prediction variance 119156.261: freq=69735489 diff=64664568 stddev=72000.000
+Resetting prediction variance 119157.245: freq=69805023 diff=62637144 stddev=72000.000
+Resetting prediction variance 119158.230: freq=69872478 diff=60716462 stddev=72000.000
+Resetting prediction variance 119159.216: freq=69937961 diff=58851439 stddev=72000.000
+Resetting prediction variance 119160.200: freq=70001522 diff=57083473 stddev=72000.000
+Resetting prediction variance 119161.185: freq=70063257 diff=55278825 stddev=72000.000
+Resetting prediction variance 119162.169: freq=70123120 diff=53601349 stddev=72000.000
+Resetting prediction variance 119163.154: freq=70181241 diff=51916732 stddev=72000.000
+Resetting prediction variance 119164.138: freq=70237604 diff=50333962 stddev=72000.000
+Resetting prediction variance 119165.122: freq=70292316 diff=48769173 stddev=72000.000
+Resetting prediction variance 119166.107: freq=70345387 diff=47248974 stddev=72000.000
+Resetting prediction variance 119167.091: freq=70396861 diff=45780948 stddev=72000.000
+Resetting prediction variance 119168.075: freq=70446790 diff=44356149 stddev=72000.000
+Resetting prediction variance 119169.059: freq=70495216 diff=42968918 stddev=72000.000
+Resetting prediction variance 119170.043: freq=70542176 diff=41663615 stddev=72000.000
+Resetting prediction variance 119171.028: freq=70587755 diff=40362823 stddev=72000.000
+Resetting prediction variance 119172.012: freq=70631954 diff=39099222 stddev=72000.000
+Resetting prediction variance 119172.997: freq=70674810 diff=37881214 stddev=72000.000
+Resetting prediction variance 119173.982: freq=70716369 diff=36699236 stddev=72000.000
+Resetting prediction variance 119174.967: freq=70756667 diff=35545183 stddev=72000.000
+Resetting prediction variance 119175.951: freq=70795732 diff=34426549 stddev=72000.000
+Resetting prediction variance 119176.935: freq=70833597 diff=33347089 stddev=72000.000
+Resetting prediction variance 119177.919: freq=70870305 diff=32303347 stddev=72000.000
+Resetting prediction variance 119178.903: freq=70905890 diff=31291567 stddev=72000.000
+Resetting prediction variance 119179.887: freq=70940387 diff=30261645 stddev=72000.000
+Resetting prediction variance 119180.872: freq=70973773 diff=29351965 stddev=72000.000
+Resetting prediction variance 119181.856: freq=71006179 diff=28380745 stddev=72000.000
+Resetting prediction variance 119182.841: freq=71037535 diff=27511701 stddev=72000.000
+Resetting prediction variance 119183.825: freq=71067950 diff=26619457 stddev=72000.000
+Resetting prediction variance 119184.810: freq=71097399 diff=25779072 stddev=72000.000
+Resetting prediction variance 119185.795: freq=71125935 diff=24965769 stddev=72000.000
+Resetting prediction variance 119186.780: freq=71153589 diff=24231726 stddev=72000.000
+Resetting prediction variance 119187.765: freq=71180445 diff=23460694 stddev=72000.000
+Resetting prediction variance 119188.749: freq=71206463 diff=22712847 stddev=72000.000
+Resetting prediction variance 119189.734: freq=71231664 diff=21996062 stddev=72000.000
+Resetting prediction variance 119190.718: freq=71256084 diff=21284341 stddev=72000.000
+Resetting prediction variance 119191.703: freq=71279726 diff=20587294 stddev=72000.000
+Resetting prediction variance 119192.687: freq=71302605 diff=19932593 stddev=72000.000
+Resetting prediction variance 119193.671: freq=71324766 diff=19295755 stddev=72000.000
+Resetting prediction variance 119194.655: freq=71346230 diff=18675197 stddev=72000.000
+Resetting prediction variance 119195.639: freq=71367012 diff=18082575 stddev=72000.000
+Resetting prediction variance 119196.624: freq=71387144 diff=17520055 stddev=72000.000
+Resetting prediction variance 119197.608: freq=71406658 diff=16955265 stddev=72000.000
+Resetting prediction variance 119198.593: freq=71425551 diff=16414128 stddev=72000.000
+Resetting prediction variance 119199.577: freq=71443848 diff=15891090 stddev=72000.000
+Resetting prediction variance 119200.562: freq=71461569 diff=15385591 stddev=72000.000
+Resetting prediction variance 119201.546: freq=71478733 diff=14896212 stddev=72000.000
+Resetting prediction variance 119202.530: freq=71495358 diff=14471946 stddev=72000.000
+Resetting prediction variance 119203.515: freq=71511514 diff=14012133 stddev=72000.000
+Resetting prediction variance 119204.500: freq=71527163 diff=13557939 stddev=72000.000
+Resetting prediction variance 119205.484: freq=71542309 diff=13119403 stddev=72000.000
+Resetting prediction variance 119206.468: freq=71556970 diff=12699853 stddev=72000.000
+Resetting prediction variance 119207.452: freq=71571166 diff=12291130 stddev=72000.000
+Resetting prediction variance 119208.436: freq=71584910 diff=11875888 stddev=72000.000
+Resetting prediction variance 119209.420: freq=71598193 diff=11484391 stddev=72000.000
+Resetting prediction variance 119210.405: freq=71611042 diff=11150345 stddev=72000.000
+Resetting prediction variance 119211.390: freq=71623520 diff=10755028 stddev=72000.000
+Resetting prediction variance 119212.374: freq=71635560 diff=10439389 stddev=72000.000
+Resetting prediction variance 119213.359: freq=71647249 diff=10076887 stddev=72000.000
+Resetting prediction variance 119214.344: freq=71658535 diff=9763809 stddev=72000.000
+Resetting prediction variance 119215.329: freq=71669474 diff=9453816 stddev=72000.000
+Resetting prediction variance 119216.313: freq=71680068 diff=9156453 stddev=72000.000
+Resetting prediction variance 119217.298: freq=71690331 diff=8870497 stddev=72000.000
+Resetting prediction variance 119218.283: freq=71700276 diff=8613750 stddev=72000.000
+Resetting prediction variance 119219.267: freq=71709935 diff=8337257 stddev=72000.000
+Resetting prediction variance 119220.251: freq=71719286 diff=8072896 stddev=72000.000
+Resetting prediction variance 119221.235: freq=71728342 diff=7794477 stddev=72000.000
+Resetting prediction variance 119222.219: freq=71737087 diff=7545084 stddev=72000.000
+Resetting prediction variance 119223.204: freq=71745554 diff=7267635 stddev=72000.000
+Resetting prediction variance 119224.189: freq=71753711 diff=7037931 stddev=72000.000
+Resetting prediction variance 119225.174: freq=71761612 diff=6810972 stddev=72000.000
+Resetting prediction variance 119226.159: freq=71769259 diff=6591171 stddev=72000.000
+Resetting prediction variance 119227.144: freq=71776661 diff=6380016 stddev=72000.000
+Resetting prediction variance 119228.128: freq=71783827 diff=6230516 stddev=72000.000
+Resetting prediction variance 119229.113: freq=71790827 diff=6022532 stddev=72000.000
+Resetting prediction variance 119230.097: freq=71797593 diff=5825545 stddev=72000.000
+Resetting prediction variance 119231.081: freq=71804139 diff=5638240 stddev=72000.000
+Resetting prediction variance 119232.065: freq=71810475 diff=5454254 stddev=72000.000
+Resetting prediction variance 119233.049: freq=71816606 diff=5281956 stddev=72000.000
+Resetting prediction variance 119234.033: freq=71822543 diff=5113221 stddev=72000.000
+Resetting prediction variance 119235.017: freq=71828291 diff=4910337 stddev=72000.000
+Resetting prediction variance 119236.001: freq=71833812 diff=4755861 stddev=72000.000
+Resetting prediction variance 119236.985: freq=71839160 diff=4604695 stddev=72000.000
+Resetting prediction variance 119237.970: freq=71844339 diff=4471310 stddev=72000.000
+Resetting prediction variance 119238.954: freq=71849368 diff=4307812 stddev=72000.000
+Resetting prediction variance 119239.939: freq=71854214 diff=4204502 stddev=72000.000
+Resetting prediction variance 119240.923: freq=71858944 diff=4045285 stddev=72000.000
+Resetting prediction variance 119241.908: freq=71863495 diff=3891371 stddev=72000.000
+Resetting prediction variance 119242.892: freq=71867874 diff=3815940 stddev=72000.000
+Resetting prediction variance 119243.877: freq=71872168 diff=3654855 stddev=72000.000
+Resetting prediction variance 119244.861: freq=71876281 diff=3533342 stddev=72000.000
+Resetting prediction variance 119245.845: freq=71880258 diff=3413808 stddev=72000.000
+Resetting prediction variance 119246.829: freq=71884101 diff=3304070 stddev=72000.000
+Resetting prediction variance 119247.813: freq=71887820 diff=3198941 stddev=72000.000
+Resetting prediction variance 119248.798: freq=71891421 diff=3110197 stddev=72000.000
+Resetting prediction variance 119249.782: freq=71894923 diff=3035914 stddev=72000.000
+Resetting prediction variance 119250.767: freq=71898342 diff=2917649 stddev=72000.000
+Resetting prediction variance 119251.751: freq=71901627 diff=2804071 stddev=72000.000
+Resetting prediction variance 119252.735: freq=71904785 diff=2713972 stddev=72000.000
+Resetting prediction variance 119253.720: freq=71907842 diff=2627952 stddev=72000.000
+Resetting prediction variance 119254.704: freq=71910802 diff=2594144 stddev=72000.000
+Resetting prediction variance 119255.689: freq=71913724 diff=2458745 stddev=72000.000
+Resetting prediction variance 119256.674: freq=71916493 diff=2380736 stddev=72000.000
+Resetting prediction variance 119257.659: freq=71919176 diff=2305080 stddev=72000.000
+Resetting prediction variance 119258.644: freq=71921773 diff=2239055 stddev=72000.000
+Resetting prediction variance 119259.629: freq=71924296 diff=2173996 stddev=72000.000
+Resetting prediction variance 119260.613: freq=71926745 diff=2107077 stddev=72000.000
+Resetting prediction variance 119261.597: freq=71929120 diff=2023554 stddev=72000.000
+Resetting prediction variance 119262.582: freq=71931400 diff=1988453 stddev=72000.000
+Resetting prediction variance 119263.567: freq=71933641 diff=1929992 stddev=72000.000
+Resetting prediction variance 119264.552: freq=71935816 diff=1866526 stddev=72000.000
+Resetting prediction variance 119265.537: freq=71937920 diff=1807780 stddev=72000.000
+Resetting prediction variance 119266.522: freq=71939958 diff=1749379 stddev=72000.000
+Resetting prediction variance 119267.507: freq=71941930 diff=1698977 stddev=72000.000
+Resetting prediction variance 119268.492: freq=71943845 diff=1603548 stddev=72000.000
+Resetting prediction variance 119269.476: freq=71945653 diff=1589598 stddev=72000.000
+Resetting prediction variance 119270.461: freq=71947445 diff=1509653 stddev=72000.000
+Resetting prediction variance 119271.445: freq=71949147 diff=1495205 stddev=72000.000
+Resetting prediction variance 119272.430: freq=71950833 diff=1414356 stddev=72000.000
+Resetting prediction variance 119273.414: freq=71952427 diff=1348992 stddev=72000.000
+Resetting prediction variance 119274.398: freq=71953948 diff=1306287 stddev=72000.000
+Resetting prediction variance 119275.382: freq=71955421 diff=1265170 stddev=72000.000
+Resetting prediction variance 119276.367: freq=71956848 diff=1241714 stddev=72000.000
+Resetting prediction variance 119277.352: freq=71958248 diff=1198823 stddev=72000.000
+Resetting prediction variance 119278.337: freq=71959600 diff=1159317 stddev=72000.000
+Resetting prediction variance 119279.322: freq=71960907 diff=1118299 stddev=72000.000
+Resetting prediction variance 119280.307: freq=71962168 diff=1085345 stddev=72000.000
+Resetting prediction variance 119281.291: freq=71963392 diff=1039423 stddev=72000.000
+Resetting prediction variance 119282.275: freq=71964564 diff=1006079 stddev=72000.000
+Resetting prediction variance 119283.260: freq=71965699 diff=974405 stddev=72000.000
+Resetting prediction variance 119284.244: freq=71966798 diff=943105 stddev=72000.000
+Resetting prediction variance 119285.229: freq=71967862 diff=913373 stddev=72000.000
+Resetting prediction variance 119286.213: freq=71968892 diff=885282 stddev=72000.000
+Resetting prediction variance 119287.197: freq=71969890 diff=856415 stddev=72000.000
+Resetting prediction variance 119288.181: freq=71970856 diff=830139 stddev=72000.000
+Resetting prediction variance 119289.166: freq=71971792 diff=803184 stddev=72000.000
+Resetting prediction variance 119290.150: freq=71972698 diff=807211 stddev=72000.000
+Resetting prediction variance 119291.135: freq=71973609 diff=782403 stddev=72000.000
+Resetting prediction variance 119292.120: freq=71974491 diff=755773 stddev=72000.000
+Resetting prediction variance 119293.105: freq=71975344 diff=735078 stddev=72000.000
+Resetting prediction variance 119294.090: freq=71976173 diff=713195 stddev=72000.000
+Resetting prediction variance 119295.074: freq=71976977 diff=686824 stddev=72000.000
+Resetting prediction variance 119296.058: freq=71977752 diff=664459 stddev=72000.000
+Resetting prediction variance 119297.042: freq=71978502 diff=641343 stddev=72000.000
+Resetting prediction variance 119298.027: freq=71979225 diff=642264 stddev=72000.000
+Resetting prediction variance 119299.011: freq=71979950 diff=615876 stddev=72000.000
+Resetting prediction variance 119299.996: freq=71980645 diff=564726 stddev=72000.000
+Resetting prediction variance 119300.980: freq=71981282 diff=523901 stddev=72000.000
+Resetting prediction variance 119301.964: freq=71981873 diff=550663 stddev=72000.000
+Resetting prediction variance 119302.949: freq=71982494 diff=513205 stddev=72000.000
+Resetting prediction variance 119303.934: freq=71983073 diff=488630 stddev=72000.000
+Resetting prediction variance 119304.918: freq=71983624 diff=501279 stddev=72000.000
+Resetting prediction variance 119305.904: freq=71984190 diff=479349 stddev=72000.000
+Resetting prediction variance 119306.888: freq=71984730 diff=456149 stddev=72000.000
+Resetting prediction variance 119307.872: freq=71985245 diff=435592 stddev=72000.000
+Resetting prediction variance 119308.857: freq=71985736 diff=420617 stddev=72000.000
+Resetting prediction variance 119309.841: freq=71986211 diff=405713 stddev=72000.000
+Resetting prediction variance 119310.825: freq=71986669 diff=375075 stddev=72000.000
+Starting Klippy...
+Args: ['/home/pi/klipper/klippy/klippy.py', '/home/pi/printer_data/config/printer.cfg', '-I', '/home/pi/printer_data/comms/klippy.serial', '-l', '/home/pi/printer_data/logs/klippy.log', '-a', '/home/pi/printer_data/comms/klippy.sock']
+Git version: 'v0.12.0-102-g9f41f53c-dirty'
+Untracked files: klippy/extras/gcode_shell_command.py
+Branch: master
+Remote: origin
+Tracked URL: https://github.com/Klipper3d/klipper
+CPU: 4 core ?
+Python: '3.11.2 (main, Mar 13 2023, 12:18:29) [GCC 12.2.0]'
+Start printer at Wed Feb  7 07:51:12 2024 (1707288672.4 17.0)
+===== Config file =====
+[virtual_sdcard]
+path = ~/printer_data/gcodes
+on_error_gcode = CANCEL_PRINT
+
+[pause_resume]
+recover_velocity = 25
+
+[display_status]
+
+[respond]
+default_prefix = 
+
+[gcode_macro CANCEL_PRINT]
+description = Cancel the actual running print
+rename_existing = BASE_CANCEL_PRINT
+gcode = 
+	TURN_OFF_HEATERS
+	G0 X5 Y220 Z10
+	CLEAR_PAUSE
+	BASE_CANCEL_PRINT
+
+[gcode_macro PAUSE]
+description = Pause the actual running print
+rename_existing = PAUSE_BASE
+gcode = 
+	
+	{% set x = params.X|default(5) %}
+	{% set y = params.Y|default(225) %}
+	{% set z = params.Z|default(10)|float %}
+	{% set e = params.E|default(1) %}
+	
+	{% set max_z = printer.toolhead.axis_maximum.z|float %}
+	{% set act_z = printer.toolhead.position.z|float %}
+	{% set lift_z = z|abs %}
+	{% if act_z < (max_z - lift_z) %}
+	{% set z_safe = lift_z %}
+	{% else %}
+	{% set z_safe = max_z - act_z %}
+	{% endif %}
+	
+	PAUSE_BASE
+	G91
+	{% if printer.extruder.can_extrude|lower == 'true' %}
+	G1 E-{e} F2100
+	{% else %}
+	{action_respond_info("Extruder not hot enough")}
+	{% endif %}
+	{% if "xyz" in printer.toolhead.homed_axes %}
+	G1 Z{z_safe}
+	G90
+	G1 X{x} Y{y} F6000
+	{% else %}
+	{action_respond_info("Printer not homed")}
+	{% endif %}
+
+[gcode_macro RESUME]
+description = Resume the actual running print
+rename_existing = RESUME_BASE
+variable_last_extruder_temp = {'restore': False, 'temp': 0}
+variable_restore_idle_timeout = 0
+variable_idle_state = False
+gcode = 
+	
+	{% set e = params.E|default(1) %}
+	
+	{% if 'VELOCITY' in params|upper %}
+	{% set get_params = ('VELOCITY=' + params.VELOCITY)  %}
+	{%else %}
+	{% set get_params = "" %}
+	{% endif %}
+	
+	G91
+	{% if printer.extruder.can_extrude|lower == 'true' %}
+	G1 E{e} F2100
+	{% else %}
+	{action_respond_info("Extruder not hot enough")}
+	{% endif %}
+	RESUME_BASE {get_params}
+
+[gcode_macro SET_PAUSE_NEXT_LAYER]
+description = Enable a pause if the next layer is reached
+gcode = 
+	{% set pause_next_layer = printer['gcode_macro SET_PRINT_STATS_INFO'].pause_next_layer %}
+	{% set ENABLE = params.ENABLE|default(1)|int != 0 %}
+	{% set MACRO = params.MACRO|default(pause_next_layer.call, True) %}
+	SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer VALUE="{{ 'enable': ENABLE, 'call': MACRO }}"
+
+[gcode_macro SET_PAUSE_AT_LAYER]
+description = Enable/disable a pause if a given layer number is reached
+gcode = 
+	{% set pause_at_layer = printer['gcode_macro SET_PRINT_STATS_INFO'].pause_at_layer %}
+	{% set ENABLE = params.ENABLE|int != 0 if params.ENABLE is defined
+	else params.LAYER is defined %}
+	{% set LAYER = params.LAYER|default(pause_at_layer.layer)|int %}
+	{% set MACRO = params.MACRO|default(pause_at_layer.call, True) %}
+	SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_at_layer VALUE="{{ 'enable': ENABLE, 'layer': LAYER, 'call': MACRO }}"
+
+[gcode_macro SET_PRINT_STATS_INFO]
+rename_existing = SET_PRINT_STATS_INFO_BASE
+description = Overwrite, to get pause_next_layer and pause_at_layer feature
+variable_pause_next_layer = { 'enable': False, 'call': "PAUSE" }
+variable_pause_at_layer = { 'enable': False, 'layer': 0, 'call': "PAUSE" }
+gcode = 
+	{% if pause_next_layer.enable %}
+	RESPOND TYPE=echo MSG='{"%s, forced by pause_next_layer" % pause_next_layer.call}'
+	{pause_next_layer.call}
+	SET_PAUSE_NEXT_LAYER ENABLE=0
+	{% elif pause_at_layer.enable and params.CURRENT_LAYER is defined and params.CURRENT_LAYER|int == pause_at_layer.layer %}
+	RESPOND TYPE=echo MSG='{"%s, forced by pause_at_layer [%d]" % (pause_at_layer.call, pause_at_layer.layer)}'
+	{pause_at_layer.call}
+	SET_PAUSE_AT_LAYER ENABLE=0
+	{% endif %}
+	SET_PRINT_STATS_INFO_BASE {rawparams}
+
+[gcode_macro _TOOLHEAD_PARK_PAUSE_CANCEL]
+description = Helper: park toolhead used in PAUSE and CANCEL_PRINT
+gcode = 
+	
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set velocity = printer.configfile.settings.pause_resume.recover_velocity %}
+	{% set use_custom     = client.use_custom_pos|default(false)|lower == 'true' %}
+	{% set custom_park_x  = client.custom_park_x|default(0.0) %}
+	{% set custom_park_y  = client.custom_park_y|default(0.0) %}
+	{% set park_dz        = client.custom_park_dz|default(2.0)|abs %}
+	{% set sp_hop         = client.speed_hop|default(15) * 60 %}
+	{% set sp_move        = client.speed_move|default(velocity) * 60 %}
+	
+	{% set origin    = printer.gcode_move.homing_origin %}
+	{% set act       = printer.gcode_move.gcode_position %}
+	{% set max       = printer.toolhead.axis_maximum %}
+	{% set cone      = printer.toolhead.cone_start_z|default(max.z) %}
+	{% set round_bed = True if printer.configfile.settings.printer.kinematics is in ['delta','polar','rotary_delta','winch']
+	else False %}
+	
+	{% set z_min = params.Z_MIN|default(0)|float %}
+	{% set z_park = [[(act.z + park_dz), z_min]|max, (max.z - origin.z)]|min %}
+	{% set x_park = params.X       if params.X is defined
+	else custom_park_x  if use_custom
+	else 0.0            if round_bed
+	else (max.x - 5.0) %}
+	{% set y_park = params.Y       if params.Y is defined
+	else custom_park_y  if use_custom
+	else (max.y - 5.0)  if round_bed and z_park < cone
+	else 0.0            if round_bed
+	else (max.y - 5.0) %}
+	
+	_CLIENT_RETRACT
+	{% if "xyz" in printer.toolhead.homed_axes %}
+	G90
+	G1 Z{z_park} F{sp_hop}
+	G1 X{x_park} Y{y_park} F{sp_move}
+	{% if not printer.gcode_move.absolute_coordinates %} G91 {% endif %}
+	{% else %}
+	RESPOND TYPE=echo MSG='Printer not homed'
+	{% endif %}
+
+[gcode_macro _CLIENT_EXTRUDE]
+description = Extrudes, if the extruder is hot enough
+gcode = 
+	
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set use_fw_retract = (client.use_fw_retract|default(false)|lower == 'true') and (printer.firmware_retraction is defined) %}
+	{% set length = params.LENGTH|default(client.unretract)|default(1.0)|float %}
+	{% set speed = params.SPEED|default(client.speed_unretract)|default(35) %}
+	{% set absolute_extrude = printer.gcode_move.absolute_extrude %}
+	
+	{% if printer.toolhead.extruder != '' %}
+	{% if printer[printer.toolhead.extruder].can_extrude %}
+	{% if use_fw_retract %}
+	{% if length < 0 %}
+	G10
+	{% else %}
+	G11
+	{% endif %}
+	{% else %}
+	M83
+	G1 E{length} F{(speed|float|abs) * 60}
+	{% if absolute_extrude %}
+	M82
+	{% endif %}
+	{% endif %}
+	{% else %}
+	RESPOND TYPE=echo MSG='{"\"%s\" not hot enough" % printer.toolhead.extruder}'
+	{% endif %}
+	{% endif %}
+
+[gcode_macro _CLIENT_RETRACT]
+description = Retracts, if the extruder is hot enough
+gcode = 
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set length = params.LENGTH|default(client.retract)|default(1.0)|float %}
+	{% set speed = params.SPEED|default(client.speed_retract)|default(35) %}
+	
+	_CLIENT_EXTRUDE LENGTH=-{length|float|abs} SPEED={speed|float|abs}
+
+[gcode_macro START_PRINT]
+gcode = 
+	RESPOND MSG="Preparing to print"
+	
+	{% set BED_TEMP = params.BED_TEMP|default(60)|float %}
+	
+	{% set EXTRUDER_TEMP = params.EXTRUDER_TEMP|default(190)|float %}
+	
+	SETUP_KAMP_MESHING DISPLAY_PARAMETERS=1 LED_ENABLE=1 FUZZ_ENABLE=1
+	SETUP_LINE_PURGE DISPLAY_PARAMETERS=1 ADAPTIVE_ENABLE=1 Z_HEIGHT=.3 PURGE_AMOUNT=20 LINE_LENGTH=25
+	
+	G90
+	M83
+	RESPOND MSG="Warming up for bed leveling"
+	M104 S170
+	M140 S{BED_TEMP}
+	M109 S170
+	M190 S{BED_TEMP}
+	G28
+	
+	
+	BED_MESH_CLEAR
+	EXCLUDE_OBJECT_DEFINE
+	RESPOND MSG="KAMP Adaptive Bed Meshing"
+	BED_MESH_CALIBRATE
+	Smart_Park
+	RESPOND MSG="Heating to print temp"
+	M104 S{EXTRUDER_TEMP}
+	G0 Z50 F240
+	RESPOND MSG="Clean bed and nozzle"
+	G0 X2 Y220 F3000
+	M109 S{EXTRUDER_TEMP}
+	RESPOND MSG="KAMP Line Purge"
+	LINE_PURGE
+	RESPOND MSG="Print Started"
+	CLEAR_PAUSE
+
+[gcode_macro END_PRINT]
+gcode = 
+	
+	RESPOND MSG="Print Finished"
+	G91
+	G1 E-.5 Z0.2 F2400
+	G1 X5 Y5 F6000
+	G1 Z10
+	G90
+	
+	
+	G1 Z{printer.toolhead.position.z + 10} F600
+	G1 X0 Y220 F6000
+	M106 S0
+	M104 S0
+	M140 S0
+	
+	
+	M84 X Y E
+
+[gcode_macro Pressure_Advance]
+gcode = 
+	SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=1 ACCEL=500
+	TUNING_TOWER COMMAND=SET_PRESSURE_ADVANCE PARAMETER=ADVANCE START=0 FACTOR=.005
+
+[gcode_macro G29]
+gcode = 
+	G28
+	BED_MESH_CALIBRATE
+	G0 X0 Y0 Z10 F6000
+	BED_MESH_PROFILE save=default
+
+[gcode_macro Load_Filament]
+gcode = 
+	SAVE_GCODE_STATE NAME=loading_filament
+	M117 Loading Filament
+	M83
+	G92 E0.0
+	G1 E5 F200
+	G92 E0.0
+	RESTORE_GCODE_STATE NAME=loading_filament
+
+[gcode_macro Unload_Filament]
+gcode = 
+	SAVE_GCODE_STATE NAME=unloading_filament
+	M125
+	M117 Unloading Filament
+	G91
+	G1 E10 F100
+	G92 E0.0
+	G1 E-5 F3000
+	G92 E0.0
+	RESTORE_GCODE_STATE NAME=unloading_filament
+
+[gcode_macro Filament_Change]
+gcode = 
+	M117 Filament Change
+	M118 Filament Change
+	SAVE_GCODE_STATE NAME=filament_change
+	PAUSE
+	G91
+	G1 E-1 F300
+	M125
+	G1 E-5 F300
+	RESTORE_GCODE_STATE NAME=filament_change
+
+[gcode_macro M600]
+gcode = 
+	{% set X = params.X|default(50)|float %}
+	{% set Y = params.Y|default(0)|float %}
+	{% set Z = params.Z|default(10)|float %}
+	SAVE_GCODE_STATE NAME=M600_state
+	PAUSE
+	G91
+	G1 E-.8 F2700
+	G1 Z{Z}
+	G90
+	G1 X{X} Y{Y} F3000
+	G91
+	G1 E-50 F1000
+	RESTORE_GCODE_STATE NAME=M600_state
+
+[gcode_macro M125]
+gcode = 
+	SAVE_GCODE_STATE NAME=parking
+	M117 Parking toolhead
+	G91
+	G1 Z10 F600
+	G90
+	G1 X5 Y225 F4000
+	RESTORE_GCODE_STATE NAME=parking
+
+[gcode_macro update_git]
+gcode = 
+	RUN_SHELL_COMMAND CMD=update_git_script
+
+[gcode_shell_command update_git_script]
+command = bash /home/pi/klipper-backup/script.sh
+timeout = 90.0
+verbose = True
+
+[gcode_macro calibrate_z_offset]
+gcode = 
+	G91
+	G1 Z10 F600
+	G90
+	G0 X140 Y150
+	PROBE_CALIBRATE
+
+[gcode_macro PID_calibrate_bed]
+gcode = 
+	{% set temp = params.temp|default(60) %}
+	PID_CALIBRATE HEATER=heater_bed TARGET={temp}
+
+[gcode_macro PID_calibrate_extruder]
+gcode = 
+	{% set temp = params.temp|default(200) %}
+	PID_CALIBRATE HEATER=extruder TARGET={temp}
+
+[gcode_macro BED_MESH_CALIBRATE]
+rename_existing = _BED_MESH_CALIBRATE
+gcode = 
+	
+	{% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+	{% set bed_mesh_min = printer.configfile.settings.bed_mesh.mesh_min %}
+	{% set bed_mesh_max = printer.configfile.settings.bed_mesh.mesh_max %}
+	{% set probe_count = printer.configfile.settings.bed_mesh.probe_count %}
+	{% set kamp_settings = printer["gcode_macro _KAMP_Settings"] %}
+	{% set verbose_enable = kamp_settings.verbose_enable | abs %}
+	{% set probe_dock_enable = kamp_settings.probe_dock_enable | abs %}
+	{% set attach_macro = kamp_settings.attach_macro | string %}
+	{% set detach_macro = kamp_settings.detach_macro | string %}
+	{% set mesh_margin = kamp_settings.mesh_margin | float %}
+	{% set fuzz_amount = kamp_settings.fuzz_amount | float %}
+	{% set probe_count = probe_count if probe_count|length > 1 else probe_count * 2  %}
+	{% set max_probe_point_distance_x = ( bed_mesh_max[0] - bed_mesh_min[0] ) / (probe_count[0] - 1)  %}
+	{% set max_probe_point_distance_y = ( bed_mesh_max[1] - bed_mesh_min[1] ) / (probe_count[1] - 1)  %}
+	{% set x_min = all_points | map(attribute=0) | min | default(bed_mesh_min[0]) %}
+	{% set y_min = all_points | map(attribute=1) | min | default(bed_mesh_min[1]) %}
+	{% set x_max = all_points | map(attribute=0) | max | default(bed_mesh_max[0]) %}
+	{% set y_max = all_points | map(attribute=1) | max | default(bed_mesh_max[1]) %}
+	
+	{% set fuzz_range = range((0) | int, (fuzz_amount * 100) | int + 1) %}
+	{% set adapted_x_min = x_min - mesh_margin - (fuzz_range | random / 100.0) %}
+	{% set adapted_y_min = y_min - mesh_margin - (fuzz_range | random / 100.0) %}
+	{% set adapted_x_max = x_max + mesh_margin + (fuzz_range | random / 100.0) %}
+	{% set adapted_y_max = y_max + mesh_margin + (fuzz_range | random / 100.0) %}
+	
+	{% set adapted_x_min = [adapted_x_min , bed_mesh_min[0]] | max %}
+	{% set adapted_y_min = [adapted_y_min , bed_mesh_min[1]] | max %}
+	{% set adapted_x_max = [adapted_x_max , bed_mesh_max[0]] | min %}
+	{% set adapted_y_max = [adapted_y_max , bed_mesh_max[1]] | min %}
+	
+	{% set points_x = (((adapted_x_max - adapted_x_min) / max_probe_point_distance_x) | round(method='ceil') | int) + 1 %}
+	{% set points_y = (((adapted_y_max - adapted_y_min) / max_probe_point_distance_y) | round(method='ceil') | int) + 1 %}
+	
+	{% if (([points_x, points_y]|max) > 6) %}
+	{% set algorithm = "bicubic" %}
+	{% set min_points = 4 %}
+	{% else %}
+	{% set algorithm = "lagrange" %}
+	{% set min_points = 3 %}
+	{% endif %}
+	
+	{% set points_x = [points_x , min_points]|max %}
+	{% set points_y = [points_y , min_points]|max %}
+	{% set points_x = [points_x , probe_count[0]]|min %}
+	{% set points_y = [points_y , probe_count[1]]|min %}
+	
+	{% if verbose_enable == True %}
+	{% if printer.exclude_object.objects != [] %}
+	
+	{ action_respond_info( "Algorithm: {}.".format(
+	(algorithm),
+	)) }
+	
+	{ action_respond_info("Default probe count: {},{}.".format(
+	(probe_count[0]),
+	(probe_count[1]),
+	)) }
+	
+	{ action_respond_info("Adapted probe count: {},{}.".format(
+	(points_x),
+	(points_y),
+	)) }
+	
+	{action_respond_info("Default mesh bounds: {}, {}.".format(
+	(bed_mesh_min[0],bed_mesh_min[1]),
+	(bed_mesh_max[0],bed_mesh_max[1]),
+	)) }
+	
+	{% if mesh_margin > 0 %}
+	{action_respond_info("Mesh margin is {}, mesh bounds extended by {}mm.".format(
+	(mesh_margin),
+	(mesh_margin),
+	)) }
+	{% else %}
+	{action_respond_info("Mesh margin is 0, margin not increased.")}
+	{% endif %}
+	
+	{% if fuzz_amount > 0 %}
+	{action_respond_info("Mesh point fuzzing enabled, points fuzzed up to {}mm.".format(
+	(fuzz_amount),
+	)) }
+	{% else %}
+	{action_respond_info("Fuzz amount is 0, mesh points not fuzzed.")}
+	{% endif %}
+	
+	{ action_respond_info("Adapted mesh bounds: {}, {}.".format(
+	(adapted_x_min, adapted_y_min),
+	(adapted_x_max, adapted_y_max),
+	)) }
+	
+	{action_respond_info("KAMP adjustments successful. Happy KAMPing!")}
+	
+	{% else %}
+	
+	{action_respond_info("No objects detected! Check your gcode and make sure that EXCLUDE_OBJECT_DEFINE is happening before BED_MESH_CALIBRATE is called. Defaulting to regular meshing.")}
+	G4 P5000
+	{% endif %}
+	
+	{% endif %}
+	
+	{% if probe_dock_enable == True %}
+	{attach_macro}
+	{% endif %}
+	
+	_BED_MESH_CALIBRATE mesh_min={adapted_x_min},{adapted_y_min} mesh_max={adapted_x_max},{adapted_y_max} ALGORITHM={algorithm} PROBE_COUNT={points_x},{points_y}
+	
+	{% if probe_dock_enable == True %}
+	{detach_macro}
+	{% endif %}
+
+[gcode_macro LINE_PURGE]
+description = A purge macro that adapts to be near your actual printed objects
+gcode = 
+	
+	{% set travel_speed = (printer.toolhead.max_velocity) * 60 | float %}
+	{% set cross_section = printer.configfile.settings.extruder.max_extrude_cross_section | float %}
+	
+	
+	{% if printer.firmware_retraction is defined %}
+	{% set RETRACT = G10 | string %}
+	{% set UNRETRACT = G11 | string %}
+	{% else %}
+	{% set RETRACT = 'G1 E-.5 F2100' | string %}
+	{% set UNRETRACT = 'G1 E.5 F2100' | string %}
+	{% endif %}
+	
+	
+	{% set verbose_enable = printer["gcode_macro _KAMP_Settings"].verbose_enable | abs %}
+	{% set purge_height = printer["gcode_macro _KAMP_Settings"].purge_height | float %}
+	{% set tip_distance = printer["gcode_macro _KAMP_Settings"].tip_distance | float %}
+	{% set purge_margin = printer["gcode_macro _KAMP_Settings"].purge_margin | float %}
+	{% set purge_amount = printer["gcode_macro _KAMP_Settings"].purge_amount | float %}
+	{% set flow_rate = printer["gcode_macro _KAMP_Settings"].flow_rate | float %}
+	
+	
+	
+	{% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+	{% set purge_x_min = (all_points | map(attribute=0) | min | default(0)) %}
+	{% set purge_x_max = (all_points | map(attribute=0) | max | default(0)) %}
+	{% set purge_y_min = (all_points | map(attribute=1) | min | default(0)) %}
+	{% set purge_y_max = (all_points | map(attribute=1) | max | default(0)) %}
+	
+	{% set purge_x_center = ([((purge_x_max + purge_x_min) / 2) - (purge_amount / 2), 0] | max) %}
+	{% set purge_y_center = ([((purge_y_max + purge_y_min) / 2) - (purge_amount / 2), 0] | max) %}
+	
+	{% set purge_x_origin = ([purge_x_min - purge_margin, 0] | max) %}
+	{% set purge_y_origin = ([purge_y_min - purge_margin, 0] | max) %}
+	
+	
+	{% set purge_move_speed = (flow_rate / 5.0) * 60 | float %}
+	
+	{% if cross_section < 5 %}
+	
+	{action_respond_info("[Extruder] max_extrude_cross_section is insufficient for purge, please set it to 5 or greater. Purge skipped.")}
+	
+	{% else %}
+	
+	{% if verbose_enable == True %}
+	
+	{action_respond_info("Moving filament tip {}mms".format(
+	(tip_distance),
+	)) }
+	{% endif %}
+	
+	{% if printer.firmware_retraction is defined %}
+	{action_respond_info("KAMP purge is using firmware retraction.")}
+	{% else %}
+	{action_respond_info("KAMP purge is not using firmware retraction, it is recommended to configure it.")}
+	{% endif %}
+	
+	{% if purge_y_origin > 0 %}
+	
+	{action_respond_info("KAMP purge starting at {}, {} and purging {}mm of filament, requested flow rate is {}mm3/s.".format(
+	(purge_x_center),
+	(purge_y_origin),
+	(purge_amount),
+	(flow_rate),
+	)) }
+	
+	{% else %}
+	
+	{action_respond_info("KAMP purge starting at {}, {} and purging {}mm of filament, requested flow rate is {}mm3/s.".format(
+	(purge_x_origin),
+	(purge_y_center),
+	(purge_amount),
+	(flow_rate),
+	)) }
+	
+	{% endif %}
+	
+	SAVE_GCODE_STATE NAME=Prepurge_State
+	
+	{% if purge_y_origin > 0 %}
+	
+	G92 E0
+	G0 F{travel_speed}
+	G90
+	G0 X{purge_x_center} Y{purge_y_origin}
+	G0 Z{purge_height}
+	M83
+	G1 E{tip_distance} F{purge_move_speed}
+	G1 X{purge_x_center + purge_amount} E{purge_amount} F{purge_move_speed}
+	{RETRACT}
+	G0 X{purge_x_center + purge_amount + 10} F{travel_speed}
+	G92 E0
+	M82
+	G0 Z{purge_height * 2} F{travel_speed}
+	
+	{% else %}
+	
+	G92 E0
+	G0 F{travel_speed}
+	G90
+	G0 X{purge_x_origin} Y{purge_y_center}
+	G0 Z{purge_height}
+	M83
+	G1 E{tip_distance} F{purge_move_speed}
+	G1 Y{purge_y_center + purge_amount} E{purge_amount} F{purge_move_speed}
+	{RETRACT}
+	G0 Y{purge_y_center + purge_amount + 10} F{travel_speed}
+	G92 E0
+	M82
+	G0 Z{purge_height * 2} F{travel_speed}
+	
+	{% endif %}
+	
+	RESTORE_GCODE_STATE NAME=Prepurge_State
+	
+	{% endif %}
+
+[gcode_macro SMART_PARK]
+description = Parks your printhead near the print area for pre-print hotend heating.
+gcode = 
+	
+	{% set kamp_settings = printer["gcode_macro _KAMP_Settings"] %}
+	{% set z_height = kamp_settings.smart_park_height | float %}
+	{% set purge_margin = kamp_settings.purge_margin | float %}
+	{% set verbose_enable = kamp_settings.verbose_enable | abs %}
+	{% set center_x = printer.toolhead.axis_maximum.x / 2 | float %}
+	{% set center_y = printer.toolhead.axis_maximum.y / 2 | float %}
+	{% set axis_minimum_x = printer.toolhead.axis_minimum.x | float %}
+	{% set axis_minimum_y = printer.toolhead.axis_minimum.y | float %}
+	{% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+	{% set x_min = all_points | map(attribute=0) | min | default(center_x) %}
+	{% set y_min = all_points | map(attribute=1) | min | default(center_y) %}
+	{% set travel_speed = (printer.toolhead.max_velocity) * 60 | float %}
+	
+	{% if purge_margin > 0 and x_min != center_x and y_min != center_y %}
+	{% set x_min = [ x_min - purge_margin , x_min ] | min %}
+	{% set y_min = [ y_min - purge_margin , y_min ] | min %}
+	{% set x_min = [ x_min , axis_minimum_x ] | max %}
+	{% set y_min = [ y_min , axis_minimum_y ] | max %}
+	{% endif %}
+	
+	
+	{% if verbose_enable == True %}
+	
+	{ action_respond_info("Smart Park location: {},{}.".format(
+	(x_min),
+	(y_min),
+	)) }
+	
+	{% endif %}
+	
+	{% if printer.toolhead.position.z < z_height %}
+	G0 Z{z_height}
+	{% endif %}
+	G0 X{x_min} Y{y_min} F{travel_speed}
+	G0 Z{z_height}
+
+[gcode_macro _KAMP_Settings]
+description = This macro contains all adjustable settings for KAMP
+variable_verbose_enable = True
+variable_mesh_margin = 0
+variable_fuzz_amount = 0
+variable_probe_dock_enable = False
+variable_attach_macro = 'Attach_Probe'
+variable_detach_macro = 'Dock_Probe'
+variable_purge_height = 0.8
+variable_tip_distance = 0
+variable_purge_margin = 10
+variable_purge_amount = 30
+variable_flow_rate = 12
+variable_smart_park_height = 10
+gcode = 
+	
+	{action_respond_info(" Running the KAMP_Settings macro does nothing, it is only used for storing KAMP settings. ")}
+
+[gcode_shell_command hello_world]
+command = echo hello world
+timeout = 2.
+verbose = True
+
+[gcode_macro HELLO_WORLD]
+gcode = 
+	RUN_SHELL_COMMAND CMD=hello_world
+
+[gcode_macro _OBICO_LAYER_CHANGE]
+description = Run a scan across the current print area
+variable_first_layer_scan_retract_length = 6
+variable_first_layer_scan_retract_speed = 15
+variable_first_layer_scan_unretract_length = 6.5
+variable_first_layer_scan_unretract_speed = 15
+variable_first_layer_scan_resume_speed = 50
+variable_first_layer_scan_enabled = True
+variable_first_layer_scan_stepover = 10
+variable_first_layer_scan_speed = 10
+variable_first_layer_scan_zhop = 4
+variable_first_layer_scan_zhop_speed = 15
+variable_verbose = False
+variable_current_layer = -1
+variable_first_layer_scanning = False
+variable_wait = {'resume': "RESUME", 'absolute_coordinates': True, 'absolute_extrude': True, 'e': 0.0}
+gcode = 
+	
+	{% set pause_macro  = "PAUSE"  if printer.configfile.settings['gcode_macro pause']  is not defined
+	else printer.configfile.settings['gcode_macro pause'].rename_existing %}
+	{% set resume_macro = "RESUME" if printer.configfile.settings['gcode_macro resume'] is not defined
+	else printer.configfile.settings['gcode_macro resume'].rename_existing %}
+	
+	{% set current_layer_default = printer.print_stats.info.current_layer if printer.print_stats.info.current_layer is not none else -1 %}
+	{% set current_layer = params.CURRENT_LAYER|default(current_layer_default)|int %}
+	
+	{% set polygon_points = printer.exclude_object.objects|map(attribute='polygon')|sum(start=[]) if printer.exclude_object is defined else [] %}
+	{% set min_x = params.MINX|default(polygon_points|map(attribute=0)|min|default(printer.toolhead.axis_minimum.x))|float %}
+	{% set min_y = params.MINY|default(polygon_points|map(attribute=1)|min|default(printer.toolhead.axis_minimum.y))|float %}
+	{% set max_x = params.MAXX|default(polygon_points|map(attribute=0)|max|default(printer.toolhead.axis_maximum.x))|float %}
+	{% set max_y = params.MAXY|default(polygon_points|map(attribute=1)|max|default(printer.toolhead.axis_maximum.y))|float %}
+	
+	{% set stepoverCount = ((max_y - min_y) / first_layer_scan_stepover|float)|round(method='ceil')|int %}
+	
+	
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Layer %d" % (current_layer)}' {% endif %}
+	SET_GCODE_VARIABLE MACRO=_OBICO_LAYER_CHANGE VARIABLE=current_layer VALUE={current_layer}
+	
+	{% if first_layer_scan_enabled and current_layer == 2 %}
+	
+	{% set wait_dic = {'resume'              : resume_macro,
+	'absolute_coordinates': printer.gcode_move.absolute_coordinates,
+	'absolute_extrude'    : printer.gcode_move.absolute_extrude,
+	'e'                   : printer.gcode_move.gcode_position.e} %}
+	SET_GCODE_VARIABLE MACRO=_OBICO_LAYER_CHANGE VARIABLE=wait VALUE="{wait_dic}"
+	
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Prepair scanning" {% endif %}
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Scan Coordinates: Min:[%.3f:%.3f] Max:[%.3f:%.3f]" % (min_x,min_y,max_x,max_y)}' {% endif %}
+	{% if printer[printer.toolhead.extruder].can_extrude %}
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Retract %.1fmm filament" % first_layer_scan_retract_length|abs}' {% endif %}
+	M83
+	G0 E-{first_layer_scan_retract_length|abs} F{first_layer_scan_retract_speed|float * 60}
+	{% endif %}
+	G91
+	G0 Z{first_layer_scan_zhop|abs} F{first_layer_scan_zhop_speed|float * 60}
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Call %s" % pause_macro}' {% endif %}
+	{pause_macro}
+	
+	
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Start scanning" {% endif %}
+	
+	UPDATE_DELAYED_GCODE ID=_WAIT_OBICO_LAYER_CHANGE DURATION=1.0
+	SET_GCODE_VARIABLE MACRO=_OBICO_LAYER_CHANGE VARIABLE=first_layer_scanning VALUE=True
+	G90
+	G0 X{min_x} Y{min_y} F{first_layer_scan_resume_speed|float * 60}
+	{% for ystep in range(stepoverCount) %}
+	G0 Y{min_y + first_layer_scan_stepover|float * ystep} F{first_layer_scan_speed|float * 60}
+	G0 X{max_x if ystep % 2 == 0 else min_x}              F{first_layer_scan_speed|float * 60}
+	{% endfor %}
+	SET_GCODE_VARIABLE MACRO=_OBICO_LAYER_CHANGE VARIABLE=first_layer_scanning VALUE=False
+	{% if verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Finish scanning" {% endif %}
+	{% endif %}
+
+[delayed_gcode _WAIT_OBICO_LAYER_CHANGE]
+gcode = 
+	{% set lc_macro = printer['gcode_macro _OBICO_LAYER_CHANGE'] %}
+	{% if lc_macro.first_layer_scanning %}
+	
+	{% if lc_macro.verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Waiting for first layer scan..." {% endif %}
+	UPDATE_DELAYED_GCODE ID=_WAIT_OBICO_LAYER_CHANGE DURATION=1.0
+	{% else %}
+	
+	{% if lc_macro.verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG="Resume print" {% endif %}
+	{% if lc_macro.verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Call %s VELOCITY=%.1f" % (lc_macro.wait.resume, lc_macro.first_layer_scan_resume_speed)}' {% endif %}
+	{lc_macro.wait.resume} VELOCITY={lc_macro.first_layer_scan_resume_speed}
+	G91
+	G0 Z-{lc_macro.first_layer_scan_zhop|abs} F{lc_macro.first_layer_scan_zhop_speed|float * 60}
+	{% if printer[printer.toolhead.extruder].can_extrude %}
+	{% if lc_macro.verbose %} RESPOND PREFIX='OBICO DEBUG:' MSG='{"Extrude %.1fmm filament" % lc_macro.first_layer_scan_unretract_length|abs}' {% endif %}
+	M83
+	G0 E{lc_macro.first_layer_scan_unretract_length|abs} F{lc_macro.first_layer_scan_unretract_speed|float * 60}
+	{% endif %}
+	
+	
+	{% if lc_macro.wait.absolute_coordinates %} G90 {% endif %}
+	{% if lc_macro.wait.absolute_extrude %}
+	M82
+	G92 E{lc_macro.wait.e}
+	{% endif %}
+	{% endif %}
+
+[exclude_object]
+
+[input_shaper]
+shaper_freq_x = 68.8
+shaper_type_x = mzv
+shaper_freq_y = 44.4
+shaper_type_y = mzv
+
+[filament_switch_sensor Filament_runout_sensor]
+pause_on_runout = False
+runout_gcode = 
+	PAUSE
+	G1 E-100 F600
+insert_gcode = 
+	
+	G1 E150 F400
+	LINE_PURGE
+	RESUME
+event_delay = 6.0
+pause_delay = 0.5
+switch_pin = PA4
+
+[bltouch]
+sensor_pin = ^PB1
+control_pin = PB0
+x_offset = -31.8
+y_offset = -40.5
+speed = 35
+samples = 3
+samples_result = median
+samples_tolerance = 0.0075
+samples_tolerance_retries = 10
+probe_with_touch_mode = true
+stow_on_each_sample = false
+z_offset = 2.010
+
+[safe_z_home]
+home_xy_position = 147, 154
+speed = 75
+z_hop = 10
+z_hop_speed = 5
+move_to_previous = true
+
+[bed_mesh]
+speed = 120
+horizontal_move_z = 8
+mesh_min = 15,15
+mesh_max = 188,186
+probe_count = 7,7
+algorithm = bicubic
+fade_start = 1
+fade_end = 10
+fade_target = 0
+
+[stepper_x]
+step_pin = PC2
+dir_pin = PB9
+enable_pin = !PC3
+microsteps = 16
+rotation_distance = 40
+endstop_pin = ^PA5
+position_endstop = 0
+position_max = 250
+homing_speed = 50
+
+[stepper_y]
+step_pin = PB8
+dir_pin = PB7
+enable_pin = !PC3
+microsteps = 16
+rotation_distance = 40
+endstop_pin = ^PA6
+position_endstop = 0
+position_max = 250
+homing_speed = 50
+
+[stepper_z]
+step_pin = PB6
+dir_pin = !PB5
+enable_pin = !PC3
+microsteps = 16
+rotation_distance = 8
+endstop_pin = probe:z_virtual_endstop
+position_max = 240
+position_min = -2
+
+[extruder]
+max_extrude_only_distance = 100.0
+step_pin = PB4
+dir_pin = PB3
+enable_pin = !PC3
+microsteps = 16
+gear_ratio = 42:12
+rotation_distance = 26.359
+nozzle_diameter = 0.400
+filament_diameter = 1.750
+heater_pin = PA1
+sensor_type = EPCOS 100K B57560G104F
+sensor_pin = PC5
+min_temp = 0
+max_temp = 300
+min_extrude_temp = 170
+max_extrude_cross_section = 5
+pressure_advance = .0465
+pressure_advance_smooth_time = 0.04
+control = pid
+pid_kp = 20.336
+pid_ki = 0.990
+pid_kd = 104.478
+
+[heater_bed]
+heater_pin = PA2
+sensor_type = EPCOS 100K B57560G104F
+sensor_pin = PC4
+min_temp = 0
+max_temp = 130
+control = pid
+pid_kp = 72.521
+pid_ki = 1.070
+pid_kd = 1229.226
+
+[fan]
+pin = PA0
+
+[mcu]
+serial = /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+restart_method = command
+
+[printer]
+kinematics = cartesian
+max_velocity = 300
+max_accel = 3500
+max_accel_to_decel = 3500
+max_z_velocity = 5
+max_z_accel = 100
+square_corner_velocity = 5
+
+[bed_screws]
+screw1 = 25, 205
+screw1_name = rear left screw
+screw2 = 195, 205
+screw2_name = rear right screw
+screw3 = 195, 35
+screw3_name = front right screw
+screw4 = 25, 35
+screw4_name = front left screw
+
+[screws_tilt_adjust]
+screw1 = 57, 229
+screw1_name = rear left screw
+screw2 = 227, 229
+screw2_name = rear right screw
+screw3 = 227, 70
+screw3_name = front right screw
+screw4 = 57, 70
+screw4_name = front left screw
+horizontal_move_z = 10
+speed = 50
+screw_thread = CW-M3
+
+[temperature_sensor raspberry_pi]
+sensor_type = temperature_host
+min_temp = 10
+max_temp = 120
+
+[firmware_retraction]
+retract_length = 0.6
+retract_speed = 85
+unretract_extra_length = 0
+unretract_speed = 40
+
+[bed_mesh default]
+version = 1
+points = 
+	-0.250000, -0.245000, -0.190000, -0.167500
+	-0.055000, -0.037500, 0.015000, 0.077500
+	0.115000, 0.150000, 0.225000, 0.267500
+x_count = 4
+y_count = 3
+mesh_x_pps = 2
+mesh_y_pps = 2
+algo = lagrange
+tension = 0.2
+min_x = 68.46000000000001
+max_x = 151.51999999999998
+min_y = 82.59
+max_y = 137.41
+=======================
+Extruder max_extrude_ratio=2.078758
+mcu 'mcu': Starting serial connect
+mcu 'mcu': got {'oid': 12, 'next_clock': 3941822208, 'value': 31364, '#name': 'analog_in_state', '#sent_time': 18.002581341000003, '#receive_time': 18.031622582}
+mcu 'mcu': got {'oid': 16, 'next_clock': 3944702208, 'value': 31285, '#name': 'analog_in_state', '#sent_time': 18.056748359, '#receive_time': 18.071603989}
+mcu 'mcu': got {'oid': 12, 'next_clock': 3963422208, 'value': 31366, '#name': 'analog_in_state', '#sent_time': 18.277275489, '#receive_time': 18.331610544}
+mcu 'mcu': got {'oid': 16, 'next_clock': 3966302208, 'value': 31286, '#name': 'analog_in_state', '#sent_time': 18.337404341000003, '#receive_time': 18.371609674000002}
+Loaded MCU 'mcu' 112 commands (v0.12.0-25-g99d7af87 / gcc: (15:12.2.rel1-1) 12.2.1 20221205 binutils: (2.39-8+rpi1+18) 2.39)
+MCU 'mcu' config: ADC_MAX=4095 BUS_PINS_i2c1=PB6,PB7 BUS_PINS_i2c1a=PB8,PB9 BUS_PINS_i2c2=PB10,PB11 BUS_PINS_spi1=PA6,PA7,PA5 BUS_PINS_spi1a=PB4,PB5,PB3 BUS_PINS_spi2=PB14,PB15,PB13 BUS_PINS_spi3=PB4,PB5,PB3 CLOCK_FREQ=72000000 MCU=stm32f103xe PWM_MAX=255 RECEIVE_WINDOW=192 RESERVE_PINS_serial=PA10,PA9 SERIAL_BAUD=250000 STATS_SUMSQ_BASE=256 STEPPER_BOTH_EDGE=1
+Configured MCU 'mcu' (1024 moves)
+bed_mesh: generated points
+Index |  Tool Adjusted  |   Probe
+  0   | (46.8, 55.5)    | (15.0, 15.0)
+  1   | (75.6, 55.5)    | (43.8, 15.0)
+  2   | (104.5, 55.5)   | (72.7, 15.0)
+  3   | (133.3, 55.5)   | (101.5, 15.0)
+  4   | (162.1, 55.5)   | (130.3, 15.0)
+  5   | (190.9, 55.5)   | (159.1, 15.0)
+  6   | (219.8, 55.5)   | (188.0, 15.0)
+  7   | (219.8, 84.0)   | (188.0, 43.5)
+  8   | (190.9, 84.0)   | (159.1, 43.5)
+  9   | (162.1, 84.0)   | (130.3, 43.5)
+  10  | (133.3, 84.0)   | (101.5, 43.5)
+  11  | (104.5, 84.0)   | (72.7, 43.5)
+  12  | (75.6, 84.0)    | (43.8, 43.5)
+  13  | (46.8, 84.0)    | (15.0, 43.5)
+  14  | (46.8, 112.5)   | (15.0, 72.0)
+  15  | (75.6, 112.5)   | (43.8, 72.0)
+  16  | (104.5, 112.5)  | (72.7, 72.0)
+  17  | (133.3, 112.5)  | (101.5, 72.0)
+  18  | (162.1, 112.5)  | (130.3, 72.0)
+  19  | (190.9, 112.5)  | (159.1, 72.0)
+  20  | (219.8, 112.5)  | (188.0, 72.0)
+  21  | (219.8, 141.0)  | (188.0, 100.5)
+  22  | (190.9, 141.0)  | (159.1, 100.5)
+  23  | (162.1, 141.0)  | (130.3, 100.5)
+  24  | (133.3, 141.0)  | (101.5, 100.5)
+  25  | (104.5, 141.0)  | (72.7, 100.5)
+  26  | (75.6, 141.0)   | (43.8, 100.5)
+  27  | (46.8, 141.0)   | (15.0, 100.5)
+  28  | (46.8, 169.5)   | (15.0, 129.0)
+  29  | (75.6, 169.5)   | (43.8, 129.0)
+  30  | (104.5, 169.5)  | (72.7, 129.0)
+  31  | (133.3, 169.5)  | (101.5, 129.0)
+  32  | (162.1, 169.5)  | (130.3, 129.0)
+  33  | (190.9, 169.5)  | (159.1, 129.0)
+  34  | (219.8, 169.5)  | (188.0, 129.0)
+  35  | (219.8, 198.0)  | (188.0, 157.5)
+  36  | (190.9, 198.0)  | (159.1, 157.5)
+  37  | (162.1, 198.0)  | (130.3, 157.5)
+  38  | (133.3, 198.0)  | (101.5, 157.5)
+  39  | (104.5, 198.0)  | (72.7, 157.5)
+  40  | (75.6, 198.0)   | (43.8, 157.5)
+  41  | (46.8, 198.0)   | (15.0, 157.5)
+  42  | (46.8, 226.5)   | (15.0, 186.0)
+  43  | (75.6, 226.5)   | (43.8, 186.0)
+  44  | (104.5, 226.5)  | (72.7, 186.0)
+  45  | (133.3, 226.5)  | (101.5, 186.0)
+  46  | (162.1, 226.5)  | (130.3, 186.0)
+  47  | (190.9, 226.5)  | (159.1, 186.0)
+  48  | (219.8, 226.5)  | (188.0, 186.0)
+Starting heater checks for heater_bed
+Starting heater checks for extruder
+webhooks client 140733872787408: New connection
+webhooks client 140733872787408: Client info {'program': 'Moonraker', 'version': 'v0.8.0-309-gf946e6a'}
+webhooks: registering remote method 'shutdown_machine' for connection id: 140733872787408
+webhooks: registering remote method 'reboot_machine' for connection id: 140733872787408
+webhooks: registering remote method 'pause_job_queue' for connection id: 140733872787408
+webhooks: registering remote method 'start_job_queue' for connection id: 140733872787408
+Stats 618.8: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000008 mcu_task_stddev=0.000006 bytes_write=4917 bytes_read=75235 bytes_retransmit=9 bytes_invalid=0 send_seq=734 receive_seq=734 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=45 upcoming_bytes=0 freq=72000265  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.54 cputime=2.461 memavail=3016144 print_time=400447.015 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 619.8: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000010 mcu_task_stddev=0.000010 bytes_write=4968 bytes_read=75361 bytes_retransmit=9 bytes_invalid=0 send_seq=735 receive_seq=735 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000297  heater_bed: target=0 temp=23.8 pwm=0.000 raspberry_pi: temp=66.1 sysload=0.54 cputime=2.467 memavail=3014944 print_time=400447.015 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 620.8: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000010 mcu_task_stddev=0.000010 bytes_write=5167 bytes_read=75597 bytes_retransmit=9 bytes_invalid=0 send_seq=749 receive_seq=747 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000273  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=66.1 sysload=0.58 cputime=2.474 memavail=3014720 print_time=400447.377 buffer_time=0.240 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 621.8: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000010 mcu_task_stddev=0.000010 bytes_write=5697 bytes_read=75941 bytes_retransmit=9 bytes_invalid=0 send_seq=773 receive_seq=773 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000294  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=66.1 sysload=0.58 cputime=2.483 memavail=3014496 print_time=400448.330 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 622.8: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000010 mcu_task_stddev=0.000010 bytes_write=6102 bytes_read=76391 bytes_retransmit=9 bytes_invalid=0 send_seq=806 receive_seq=806 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000306  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=64.5 sysload=0.58 cputime=2.494 memavail=3014496 print_time=400449.330 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 623.8: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000010 mcu_task_stddev=0.000010 bytes_write=6524 bytes_read=76859 bytes_retransmit=9 bytes_invalid=0 send_seq=840 receive_seq=840 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000338  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.58 cputime=2.503 memavail=3014496 print_time=400450.330 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 624.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000015 mcu_task_stddev=0.000008 bytes_write=6958 bytes_read=77340 bytes_retransmit=9 bytes_invalid=0 send_seq=875 receive_seq=874 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000316  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=66.1 sysload=0.58 cputime=2.513 memavail=3014496 print_time=400451.330 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 625.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000015 mcu_task_stddev=0.000008 bytes_write=7380 bytes_read=77813 bytes_retransmit=9 bytes_invalid=0 send_seq=909 receive_seq=909 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000345  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=64.5 sysload=0.61 cputime=2.521 memavail=3014608 print_time=400452.330 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 626.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000015 mcu_task_stddev=0.000008 bytes_write=7905 bytes_read=78278 bytes_retransmit=9 bytes_invalid=0 send_seq=942 receive_seq=942 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000326  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=66.7 sysload=0.61 cputime=2.532 memavail=3014608 print_time=400453.396 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 627.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000015 mcu_task_stddev=0.000008 bytes_write=8574 bytes_read=78604 bytes_retransmit=9 bytes_invalid=0 send_seq=967 receive_seq=967 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=16 upcoming_bytes=26 freq=72000313  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.61 cputime=2.540 memavail=3022400 print_time=400456.770 buffer_time=2.629 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 628.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000015 mcu_task_stddev=0.000008 bytes_write=8596 bytes_read=78725 bytes_retransmit=9 bytes_invalid=0 send_seq=968 receive_seq=968 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=26 freq=72000308  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.61 cputime=2.544 memavail=3022400 print_time=400456.770 buffer_time=1.628 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 629.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000015 mcu_task_stddev=0.000010 bytes_write=8602 bytes_read=78860 bytes_retransmit=9 bytes_invalid=0 send_seq=969 receive_seq=969 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=26 freq=72000306  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.61 cputime=2.549 memavail=3019552 print_time=400456.770 buffer_time=0.628 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 630.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000015 mcu_task_stddev=0.000010 bytes_write=8627 bytes_read=78987 bytes_retransmit=9 bytes_invalid=0 send_seq=972 receive_seq=972 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=18 freq=72000322  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.65 cputime=2.553 memavail=3019328 print_time=400456.770 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 631.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000015 mcu_task_stddev=0.000010 bytes_write=8769 bytes_read=79219 bytes_retransmit=9 bytes_invalid=0 send_seq=981 receive_seq=981 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=18 freq=72000344  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.65 cputime=2.559 memavail=3019152 print_time=400458.736 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 632.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000015 mcu_task_stddev=0.000010 bytes_write=9073 bytes_read=79519 bytes_retransmit=9 bytes_invalid=0 send_seq=1001 receive_seq=1001 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000319  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.65 cputime=2.567 memavail=3019152 print_time=400459.336 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 633.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000015 mcu_task_stddev=0.000010 bytes_write=9507 bytes_read=79986 bytes_retransmit=9 bytes_invalid=0 send_seq=1036 receive_seq=1035 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000349  heater_bed: target=0 temp=23.8 pwm=0.000 raspberry_pi: temp=66.1 sysload=0.65 cputime=2.581 memavail=3018928 print_time=400460.336 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 634.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000013 mcu_task_stddev=0.000007 bytes_write=9929 bytes_read=80473 bytes_retransmit=9 bytes_invalid=0 send_seq=1070 receive_seq=1070 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000320  heater_bed: target=0 temp=23.8 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.65 cputime=2.595 memavail=3018704 print_time=400461.336 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 635.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000013 mcu_task_stddev=0.000007 bytes_write=10341 bytes_read=80931 bytes_retransmit=9 bytes_invalid=0 send_seq=1102 receive_seq=1102 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000348  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.08 cputime=2.607 memavail=3015424 print_time=400462.336 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 636.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000013 mcu_task_stddev=0.000007 bytes_write=10702 bytes_read=81221 bytes_retransmit=9 bytes_invalid=0 send_seq=1120 receive_seq=1120 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000335  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.08 cputime=2.618 memavail=3016768 print_time=400463.777 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 637.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000013 mcu_task_stddev=0.000007 bytes_write=10938 bytes_read=81506 bytes_retransmit=9 bytes_invalid=0 send_seq=1137 receive_seq=1137 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000340  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.08 cputime=2.626 memavail=3019552 print_time=400464.327 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 638.8: gcodein=0  mcu: mcu_awake=0.003 mcu_task_avg=0.000013 mcu_task_stddev=0.000007 bytes_write=11340 bytes_read=81974 bytes_retransmit=9 bytes_invalid=0 send_seq=1171 receive_seq=1171 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000310  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.08 cputime=2.635 memavail=3021888 print_time=400465.327 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 639.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000014 mcu_task_stddev=0.000007 bytes_write=11710 bytes_read=82417 bytes_retransmit=9 bytes_invalid=0 send_seq=1200 receive_seq=1200 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=8 freq=72000331  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.08 cputime=2.645 memavail=3019264 print_time=400466.237 buffer_time=0.090 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 640.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000014 mcu_task_stddev=0.000007 bytes_write=12142 bytes_read=82669 bytes_retransmit=9 bytes_invalid=0 send_seq=1213 receive_seq=1213 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=56 upcoming_bytes=0 freq=72000346  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.07 cputime=2.655 memavail=3019264 print_time=400471.783 buffer_time=4.635 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 641.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000014 mcu_task_stddev=0.000007 bytes_write=12204 bytes_read=82790 bytes_retransmit=9 bytes_invalid=0 send_seq=1214 receive_seq=1214 retransmit_seq=2 srtt=0.003 rttvar=0.001 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000377  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.07 cputime=2.661 memavail=3018816 print_time=400471.783 buffer_time=3.634 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 642.8: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000014 mcu_task_stddev=0.000007 bytes_write=12210 bytes_read=82896 bytes_retransmit=9 bytes_invalid=0 send_seq=1215 receive_seq=1215 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000354  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.07 cputime=2.666 memavail=3018816 print_time=400471.783 buffer_time=2.634 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 643.9: gcodein=0  mcu: mcu_awake=0.004 mcu_task_avg=0.000014 mcu_task_stddev=0.000007 bytes_write=12216 bytes_read=83017 bytes_retransmit=9 bytes_invalid=0 send_seq=1216 receive_seq=1216 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000347  heater_bed: target=0 temp=23.8 pwm=0.000 raspberry_pi: temp=64.5 sysload=1.07 cputime=2.670 memavail=3018576 print_time=400471.783 buffer_time=1.633 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 644.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000012 mcu_task_stddev=0.000012 bytes_write=12222 bytes_read=83152 bytes_retransmit=9 bytes_invalid=0 send_seq=1217 receive_seq=1217 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000332  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.07 cputime=2.675 memavail=3018576 print_time=400471.783 buffer_time=0.632 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 645.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000012 mcu_task_stddev=0.000012 bytes_write=12359 bytes_read=83273 bytes_retransmit=9 bytes_invalid=0 send_seq=1221 receive_seq=1221 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000360  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=66.7 sysload=1.06 cputime=2.680 memavail=3018608 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 646.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000012 mcu_task_stddev=0.000012 bytes_write=12365 bytes_read=83394 bytes_retransmit=9 bytes_invalid=0 send_seq=1222 receive_seq=1222 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000330  heater_bed: target=0 temp=23.6 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.06 cputime=2.685 memavail=3018608 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 647.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000012 mcu_task_stddev=0.000012 bytes_write=12371 bytes_read=83515 bytes_retransmit=9 bytes_invalid=0 send_seq=1223 receive_seq=1223 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000303  heater_bed: target=0 temp=23.8 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.06 cputime=2.690 memavail=3018608 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 648.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000012 mcu_task_stddev=0.000012 bytes_write=12377 bytes_read=83621 bytes_retransmit=9 bytes_invalid=0 send_seq=1224 receive_seq=1224 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000288  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.06 cputime=2.693 memavail=3017920 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 649.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000009 mcu_task_stddev=0.000009 bytes_write=12383 bytes_read=83755 bytes_retransmit=9 bytes_invalid=0 send_seq=1225 receive_seq=1225 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000281  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.06 cputime=2.697 memavail=3017920 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 650.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000009 mcu_task_stddev=0.000009 bytes_write=12389 bytes_read=83876 bytes_retransmit=9 bytes_invalid=0 send_seq=1226 receive_seq=1226 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000322  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.06 cputime=2.702 memavail=3017920 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 651.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000009 mcu_task_stddev=0.000009 bytes_write=12395 bytes_read=83982 bytes_retransmit=9 bytes_invalid=0 send_seq=1227 receive_seq=1227 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000295  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=66.1 sysload=1.06 cputime=2.706 memavail=3017920 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.2 pwm=0.000
+Stats 652.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000009 mcu_task_stddev=0.000009 bytes_write=12401 bytes_read=84103 bytes_retransmit=9 bytes_invalid=0 send_seq=1228 receive_seq=1228 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000302  heater_bed: target=0 temp=23.6 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.06 cputime=2.711 memavail=3017712 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 653.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000009 mcu_task_stddev=0.000009 bytes_write=12407 bytes_read=84224 bytes_retransmit=9 bytes_invalid=0 send_seq=1229 receive_seq=1229 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000328  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.5 sysload=1.06 cputime=2.716 memavail=3017712 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 654.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000008 mcu_task_stddev=0.000007 bytes_write=12413 bytes_read=84343 bytes_retransmit=9 bytes_invalid=0 send_seq=1230 receive_seq=1230 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000301  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=1.06 cputime=2.721 memavail=3017712 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 655.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000008 mcu_task_stddev=0.000007 bytes_write=12419 bytes_read=84464 bytes_retransmit=9 bytes_invalid=0 send_seq=1231 receive_seq=1231 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000276  heater_bed: target=0 temp=23.7 pwm=0.000 raspberry_pi: temp=65.0 sysload=0.97 cputime=2.729 memavail=3017712 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
+Stats 656.9: gcodein=0  mcu: mcu_awake=0.001 mcu_task_avg=0.000008 mcu_task_stddev=0.000007 bytes_write=12425 bytes_read=84585 bytes_retransmit=9 bytes_invalid=0 send_seq=1232 receive_seq=1232 retransmit_seq=2 srtt=0.003 rttvar=0.000 rto=0.025 ready_bytes=0 upcoming_bytes=0 freq=72000311  heater_bed: target=0 temp=23.6 pwm=0.000 raspberry_pi: temp=64.5 sysload=0.97 cputime=2.733 memavail=3017712 print_time=400471.783 buffer_time=0.000 print_stall=0 extruder: target=0 temp=25.1 pwm=0.000
